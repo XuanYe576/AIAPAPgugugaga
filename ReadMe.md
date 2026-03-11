@@ -152,6 +152,26 @@ Checkpoint behavior:
 - a checkpoint file and model weights are saved when validation improves
 - validation or test can be rerun later from the saved checkpoint
 
+## Metrics Visualization
+
+Use the metrics script to turn saved `history.csv` and `summary.json` files into figures:
+
+```bash
+cd mainPAP
+python3 metrics/visualize_results.py
+```
+
+Optional:
+
+- `--run-dir results/patch_antenna_ai_r5`
+- `--run-dir results/R5PINN_perF`
+- `--output-dir metrics/figures`
+
+The script creates:
+
+- one dashboard PNG per run
+- one comparison PNG when multiple runs are available
+
 ## GitHub setup
 
 GitHub usually recommends every repository include a `README`, `LICENSE`, and `.gitignore`. This repo now has a readable project README. A `LICENSE` can still be added later if you want the repository to be publicly reusable under explicit terms.
