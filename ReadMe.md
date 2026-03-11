@@ -2,7 +2,7 @@
 
 This project explores data-driven patch antenna design with hybrid encoder-decoder models that predict S11 responses from `10 x 10` binary patch geometries.
 
-The main runnable baseline in the current repository snapshot is `Model/patch_antenna_ai_r5.py`. Older notebooks, archived experiments, and supporting notes are kept under `old/`.
+The main runnable entry point in the current repository snapshot is `main.py`. Older notebooks, archived experiments, and supporting notes are kept under `old/`.
 
 ## Repository layout
 
@@ -21,23 +21,136 @@ The main runnable baseline in the current repository snapshot is `Model/patch_an
 - `Tiny CNN regressor`: compact direct baseline without the FEDformer-style decoder.
 - `LightGBM baseline`: one regressor per frequency point as a non-neural baseline.
 
-## Quick setup
-
-If you already know the usual Python workflow, the shortest path is:
+## Setup
 
 ```bash
 cd mainPAP
 python3 -m venv .venv
 source .venv/bin/activate
 pip install numpy pandas matplotlib torch
-python Model/patch_antenna_ai_r5.py --csv-path patch_antennas_updated.csv
 ```
 
-Notes:
+## Training Entry Point
 
-- The current R5 script writes outputs under `results/patch_antenna_ai_r5/`.
-- If you later place `Full_1000Data.csv` in `Data/`, the script can use that layout directly.
-- Archived notebook-based experiments remain under `old/model_training/notebooks/`.
+Use the surface launcher:
+
+```bash
+python3 main.py ...
+```
+
+`main.py` forwards to:
+
+- `Model/patch_antenna_ai_r5.py` for the non-PINN path
+- `Model/PINN/R5PINN_perF.py` for the PINN path when `--usepinn` is present
+
+## Data Preparation
+
+For the uploaded `30000`-antenna raw dataset, preprocess once first:
+
+```bash
+cd mainPAP
+python3 main.py --usepinn preprocess --overwrite-processed
+```
+
+This builds:
+
+- `Data/processed/Full_30000Data_61dB.csv`
+- `Data/processed/Full_30000Data_61dB.meta.json`
+
+## Common Commands
+
+Train without PINN:
+
+```bash
+cd mainPAP
+python3 main.py \
+  --csv-path Data/processed/Full_30000Data_61dB.csv \
+  --output-mode mag_only \
+  --epochs 80 \
+  --batch-size 32 \
+  --device auto
+```
+
+Train with PINN:
+
+```bash
+cd mainPAP
+python3 main.py --usepinn \
+  --epochs 80 \
+  --batch-size 256 \
+  --device auto
+```
+
+Use Adagrad:
+
+```bash
+python3 main.py \
+  --csv-path Data/processed/Full_30000Data_61dB.csv \
+  --output-mode mag_only \
+  --optimizer adagrad
+```
+
+Use Adagrad with PINN:
+
+```bash
+python3 main.py --usepinn \
+  --optimizer adagrad
+```
+
+Print one training log every 10 batches:
+
+```bash
+python3 main.py \
+  --csv-path Data/processed/Full_30000Data_61dB.csv \
+  --output-mode mag_only \
+  --log-every-batches 10
+```
+
+Evaluate a saved checkpoint on validation:
+
+```bash
+python3 main.py \
+  --csv-path Data/processed/Full_30000Data_61dB.csv \
+  --output-mode mag_only \
+  --eval-split val
+```
+
+Evaluate a saved checkpoint on test:
+
+```bash
+python3 main.py --usepinn --eval-split test
+```
+
+Rebuild processed data and then train with PINN:
+
+```bash
+python3 main.py --usepinn \
+  --overwrite-processed \
+  --epochs 80 \
+  --batch-size 256
+```
+
+## Logging And Checkpoints
+
+Both backends now support:
+
+- `--optimizer adamw|adagrad`
+- `--log-every-batches N`
+- `--eval-split val|test`
+- checkpoint saving
+- history CSV logging
+- JSON summary output
+
+Output locations:
+
+- non-PINN: `results/patch_antenna_ai_r5/`
+- PINN: `results/R5PINN_perF/`
+
+Checkpoint behavior:
+
+- the best model is chosen by validation loss
+- a checkpoint file and model weights are saved when validation improves
+- validation or test can be rerun later from the saved checkpoint
 
 ## GitHub setup
 

@@ -1,6 +1,4 @@
-# R5 vs Specification: 9 Critical Deviations
-
----
+# Problems and Discoveries
 
 ## 1. Output Configuration Downgraded
 
@@ -21,7 +19,7 @@ output: (ReΓ, ImΓ)  # complex
 |--------|-----|------|
 | Resolution | 61-point | 122-point |
 | Target | \|S11\| only | Complex Γ |
-| Phase info | ❌ Absent | ✅ Required |
+| Phase info | Absent | Required |
 
 **Impact**: Loses narrow notch localization, steep slope fidelity, resonance shift sensitivity.
 
@@ -71,7 +69,7 @@ def build_grid_adjacency(h=10, w=10):
 | Feature | R5 | Spec |
 |---------|-----|------|
 | Connectivity | Deterministic 4-neighbor | k-NN adaptive |
-| Edge features | ❌ None | ✅ Geometric descriptors |
+| Edge features | None | Geometric |
 | Range | Local only | Local + non-local |
 
 **Impact**: Weak global topology representation; misses long-range current path effects on resonance.

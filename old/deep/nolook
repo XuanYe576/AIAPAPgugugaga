@@ -1,0 +1,309 @@
+# Discoveries and Problems
+
+## 1. Output configuration is reduced to a lower-information regression setting
+
+### Code evidence
+
+```python
+class Cfg:
+    input_dim: int = 100
+    seq_len: int = 61
+    output_mode: str = "mag_only"
+    batch_size: int = 64
+    lr: float = 1e-3
+    epochs: int = 50
+    val_split: float = 0.2
+    dmodel: int = 128
+    nhead: int = 8
+    ffn_hidden: int = 256
+    num_transformer_layers: int = 2
+    num_spectral_blocks: int = 2
+    top_k_freq: int = 16
+    transformer_dropout: float = 0.3
+    weight_decay: float = 1e-5
+```
+
+### Discovery
+
+R5 is not training the full target problem stated in the design specification. It is configured as a **61-point, magnitude-only surrogate regression model**, rather than the intended **122-point complex S11 predictor**. The design specification instead calls for `freq_points: 122`, complex output `(ReΓ, ImΓ)`, and a geometry-conditioned FEDformer decoder.
+
+### Problems
+
+The first issue is **spectral information reduction**. Setting `seq_len = 61` reduces the output sequence to half-resolution relative to the intended 122-point prediction. This is not merely a computational shortcut; it weakens the model’s ability to localize narrow notches, small resonance shifts, and steep local slopes. The specification explicitly proposes 61-point training only as an initial curriculum stage, followed by fine-tuning on all 122 points.
+
+The second issue is **physical incompleteness**. With `output_mode = "mag_only"`, the model is no longer trained on the full complex reflection coefficient. This removes phase information and therefore collapses the learning target from a complex scattering observable to a reduced magnitude-only projection. The specification, by contrast, requires complex-valued prediction and loss design that respects complex structure.
+
+The third issue is **training-budget compression**. The configuration uses `epochs = 50` and provides no cosine warmup schedule, while the specification recommends AdamW, cosine warmup, and approximately 280–340 epochs with patience 30. This does not prove failure, but it does indicate that R5 is functioning as a rapid baseline rather than the intended research-grade training regime.
+
+### Consequence
+
+R5 appears optimized for **obtaining a trainable baseline quickly**, not for maximizing fidelity in resonance-sensitive EM surrogate modeling.
+
+---
+
+## 2. The “complex output” path is mostly nominal; default training collapses to magnitude-only supervision
+
+### Code evidence
+
+```python
+if output_mode == "complex_61":
+    ...
+    y_real = values[:, input_dim:input_dim+seq_len]
+    y_imag = values[:, input_dim+seq_len:input_dim+2*seq_len]
+elif output_mode == "mag_only":
+    ...
+    x = values[:, :input_dim]
+    y_real = values[:, input_dim:input_dim+seq_len]
+    y_imag = np.zeros_like(y_real)
+```
+
+### Discovery
+
+The implementation preserves a formal two-channel interface, but under the default `mag_only` setting the imaginary part is not learned from data; it is explicitly filled with zeros. Thus, the model does not solve a genuine complex-valued regression problem, even though the tensor shape still mimics one.
+
+### Problems
+
+This is a substantive reduction of the target space. Under `mag_only`, the supervised signal becomes effectively
+
+[
+y(f) = [,|S_{11}(f)|,\ 0,].
+]
+
+Hence the second channel is not a physically meaningful target. The network is not learning full port scattering behavior, impedance-related phase structure, or complex resonance trajectories. This directly conflicts with the specification, which requires an output head producing `(ReΓ, ImΓ)` together with a loss that respects complex values.
+
+### Consequence
+
+The model may reproduce amplitude trends reasonably well, but it cannot be rigorously described as learning **complex S-parameter physics**.
+
+---
+
+## 3. Graph construction is fixed-grid nearest-neighbor adjacency, not a richer geometric graph
+
+### Code evidence
+
+```python
+def build_grid_adjacency(h=10, w=10):
+    ...
+    if r > 0:     A[i, idx(r-1, c)] = 1
+    if r < h-1:   A[i, idx(r+1, c)] = 1
+    if c > 0:     A[i, idx(r, c-1)] = 1
+    if c < w-1:   A[i, idx(r, c+1)] = 1
+    A += _np.eye(N, dtype=_np.float32)
+```
+
+### Discovery
+
+The graph used by R5 is a **deterministic four-neighbor lattice graph with self-loops**. Connectivity is fixed by grid location and is not enriched by additional geometric descriptors.
+
+### Problems
+
+This is materially simpler than the graph design proposed in the specification, which recommends **k-NN edges**, richer geometric connectivity, and edge features such as (\Delta x,\Delta y,\text{distance},\cos\theta,\sin\theta). The fixed-grid adjacency gives the encoder access to only immediate local neighbors and does not explicitly encode broader geometric relations or shape-aware proximity. In a patch-topology problem, such higher-order structure can matter because resonance is often governed by global current paths rather than local occupancy bits alone.
+
+### Consequence
+
+The model can capture **local spatial continuity**, but its representation of **global topology and long-range geometric coupling** is weaker than the intended design.
+
+---
+
+## 4. The graph encoder is a 2-layer GCN-like averaging encoder
+
+### Code evidence
+
+```python
+class GraphConv(nn.Module):
+    def __init__(self, in_dim, out_dim, A_norm):
+        super().__init__()
+        self.A = A_norm
+        self.lin = nn.Linear(in_dim, out_dim)
+
+    def forward(self, x):
+        Ax = torch.einsum("ij,bjf->bif", self.A, x)
+        return F.relu(self.lin(Ax))
+```
+
+```python
+class GridGraphEncoder(nn.Module):
+    def __init__(self, d_model=128, node_feat_dim=1, hidden_dims=(32, 64), A_norm=None):
+        ...
+        self.gc1 = GraphConv(node_feat_dim, hidden_dims[0], self.A)
+        self.gc2 = GraphConv(hidden_dims[0], hidden_dims[1], self.A)
+        self.readout = nn.Linear(hidden_dims[1], d_model)
+
+    def forward(self, geom_bits):
+        B = geom_bits.size(0)
+        x = geom_bits.view(B, 100, 1)
+        h = self.gc1(x)
+        h = self.gc2(h)
+        g = h.mean(dim=1)
+        g = self.readout(g)
+        return g
+```
+
+### Discovery
+
+The encoder is a **2-layer GCN-like averaging encoder**. It performs fixed neighborhood aggregation, applies ReLU, then uses global average pooling and a linear projection to obtain the geometry embedding.
+
+### Problems
+
+The node feature space is minimal: each node contains only a single binary metallization indicator. There is no explicit positional encoding, no material descriptor, and no local geometric statistic. The message passing mechanism is also highly simplified relative to the specification: there is no learned attention over neighbors, no edge MLP, no node update MLP, no LayerNorm, and no GELU. Finally, the readout operation
+
+[
+g = h.mean(dim=1)
+]
+
+is a uniform averaging operator rather than the **global attention pooling** specified in the design document. The target design instead recommends a **3-layer GATv2 encoder**, with edge modeling and attention-based readout.
+
+### Consequence
+
+This encoder is a reasonable **small-data baseline**, but it is unlikely to be a strong geometry reasoning module for high-fidelity resonance prediction.
+
+---
+
+## 5. Geometry conditioning is collapsed into a single global latent that is linearly unfolded into the whole sequence
+
+### Code evidence
+
+```python
+self.to_tokens = nn.Linear(dmodel, seq_len * dmodel)
+...
+g = self.encoder(geom_bits)
+tokens = self.to_tokens(g).view(-1, self.seq_len, self.dmodel)
+return self.decoder(tokens)
+```
+
+### Discovery
+
+The encoder output is a single geometry vector, which is then linearly expanded into the entire decoder token sequence.
+
+### Problems
+
+This is a substantial simplification of the intended encoder-decoder interface. The specification proposes a `[GEOM]` token prepended to the frequency sequence, with the decoder conditioned explicitly through cross-attention. R5 instead assumes that one global latent can be unfolded in one shot into all sequence positions. That is computationally convenient, but it weakens the inductive bias for learning structured frequency-specific interactions with geometry.
+
+### Consequence
+
+The model may learn a smooth global mapping from geometry to spectrum, but it is less explicitly equipped to model **frequency-localized geometry effects**, such as notch migration or multi-resonance interference.
+
+---
+
+## 6. The “FEDformer” portion is a lightweight spectral-transformer approximation, not a full conditional FEDformer decoder
+
+### Code evidence
+
+```python
+class SpectralBlock(nn.Module):
+    def __init__(self, d_model, seq_len, top_k=16, ffn_hidden=256):
+        ...
+        self.top_k = min(top_k, seq_len // 2 + 1)
+        self.w_real = nn.Parameter(torch.randn(d_model, self.top_k) * 0.02)
+        self.w_imag = nn.Parameter(torch.randn(d_model, self.top_k) * 0.02)
+        ...
+    def forward(self, x):
+        ...
+        X = torch.fft.rfft(x_ch, dim=-1)
+        k = self.top_k
+        idx = torch.arange(k, device=X.device)
+        Xk = X[..., idx]
+        ...
+        X_new = torch.zeros_like(X)
+        X_new[..., idx] = Xk_mod
+        x_time = torch.fft.irfft(X_new, n=L, dim=-1).transpose(1, 2)
+        x = residual + x_time
+        y = self.ff(self.ln2(x))
+        return x + y
+```
+
+### Discovery
+
+The decoder retains a Fourier-domain prior, but the implemented module is essentially a **truncated low-frequency spectral block** followed by residual mixing and feed-forward transformation. In practice, only the first `top_k_freq = 16` Fourier modes are explicitly manipulated.
+
+### Problems
+
+This is not equivalent to the fuller conditional FEDformer setup described in the specification. The implemented decoder behaves more like a compact Fourier bottleneck prior than a full geometry-conditioned sequence decoder. Since only a limited subset of Fourier modes is retained, the model is biased toward smoother spectral structure. That can stabilize training, but it may suppress fine spectral detail, precisely where narrow resonances and sharp notches reside.
+
+### Consequence
+
+The decoder likely favors **smooth spectral reconstructions**, which may improve robustness but reduce sharp-feature fidelity.
+
+---
+
+## 7. Loss design is underpowered relative to the physics and application metrics
+
+### Code evidence
+
+```python
+def complex_mse(pred, target): 
+    return F.mse_loss(pred, target)
+```
+
+### Discovery
+
+The training objective is implemented as plain elementwise MSE, despite being named `complex_mse`.
+
+### Problems
+
+The design specification explicitly requires a loss that satisfies three criteria: it should respect complex values, emphasize resonant regions, and reflect application-level accuracy such as resonant frequency and bandwidth. It further proposes **complex MSE + small dB MAE + weighting around minima + |Γ|≤1 enforcement**, with optional heads for (f_0) and (-10) dB bandwidth. By contrast, plain MSE distributes error uniformly across all sampled frequencies. In S11 regression, this can yield acceptable average loss while still missing the notch depth, notch location, or (-10) dB bandwidth that matter most in antenna design.
+
+### Consequence
+
+Even if optimization converges, the resulting surrogate may be **numerically smooth yet electromagnetically misaligned with design objectives**.
+
+---
+
+## 8. Target-space augmentation is used in place of physically grounded input perturbation
+
+### Code evidence
+
+```python
+def augment_batch(x, y, cfg: Cfg):
+    y = y.clone()
+
+    if cfg.aug_noise_std > 0.0:
+        noise = torch.randn(B, L, device=y.device) * cfg.aug_noise_std
+        noise = noise.unsqueeze(-1)
+        y = y + noise
+
+    if cfg.aug_freq_mask_prob > 0.0 and cfg.aug_freq_mask_width > 0:
+        ...
+        y[b, start:start + w, :] = 0.0
+```
+
+### Discovery
+
+Augmentation is applied directly to the regression target (y), not to the geometry input or to physically meaningful nuisance variables.
+
+### Problems
+
+This choice differs sharply from the specification, which recommends **geometry jitter, feed-offset perturbation, and material jitter** to mimic manufacturing and modeling uncertainty. In R5, the training signal itself is perturbed by additive noise and random frequency masking. That may act as a regularizer, but it also risks corrupting precisely the resonance regions the model should learn most accurately.
+
+### Consequence
+
+The model may become more robust in a generic sequence-learning sense, but the augmentation is not clearly aligned with the underlying EM physics.
+
+---
+
+## 9. Training protocol is simplified relative to the intended study design
+
+### Code evidence
+
+```python
+train_ds, val_ds = random_split(ds, [n_train, n_val], generator=torch.Generator().manual_seed(42))
+...
+opt = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+best_val = float("inf"); patience, left = 10, 10
+for epoch in range(1, cfg.epochs+1):
+    ...
+```
+
+### Discovery
+
+R5 uses a straightforward protocol: random train/validation split, AdamW, fixed learning rate, early stopping with patience 10, and a short training horizon.
+
+### Problems
+
+This differs materially from the specification, which recommends cosine warmup, gradient clipping, mixed precision, longer training, and most importantly **family-based splitting rather than random splitting**. In geometry tasks, random splitting can produce overly optimistic validation estimates if highly similar topologies appear in both train and validation subsets. A family-based split is more demanding, but it is also a more honest assessment of generalization.
+
+### Consequence
+
+Reported validation performance under this protocol is more likely to reflect **interpolation across similar geometries** than robust generalization to unseen topology families.
+
+**R5 is not merely a smaller version of the specified model; it is a different problem formulation and training regime, reduced from a complex, resonance-aware, geometry-conditioned EM surrogate into a compact magnitude-dominant baseline designed primarily for rapid executability.**
