@@ -1,0 +1,424 @@
+# 1) Setup & installs
+# Colab usually has torch; ensure gradio/matplotlib/pandas/numpy are available
+!pip -q install gradio matplotlib pandas numpy
+
+
+# 2) Configuration
+from dataclasses import dataclass
+
+@dataclass
+class Cfg:
+    csv_path: str = "/content/Test2.CSV"   # <-- set to your training CSV (or leave and use the synthetic demo generator below)
+    test_csv_path: str = "/content/Test2.csv"  # <-- optional test CSV; if missing, we'll evaluate on validation split only
+    input_dim: int = 100
+    seq_len: int = 61
+    output_mode: str = "complex_61"   # "complex_61" or "mag_only"
+    batch_size: int = 64
+    lr: float = 1e-3
+    epochs: int = 50
+    val_split: float = 0.2
+    dmodel: int = 128
+    nhead: int = 8
+    ffn_hidden: int = 256
+    num_transformer_layers: int = 2
+    num_spectral_blocks: int = 2
+    top_k_freq: int = 16
+    freq_hz_start: float = 1e9
+    freq_hz_stop: float = 6e9
+    device: str = "auto"             # "auto", "cuda", or "cpu"
+
+CFG = Cfg()
+print(CFG)
+
+
+
+# 3) Imports, Dataset
+import math
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, random_split
+
+def get_device(name: str):
+    if name == "auto":
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    return name
+
+class AntennaDataset(Dataset):
+    def __init__(self, csv_path, input_dim=100, seq_len=61, output_mode="complex_61"):
+        df = pd.read_csv(csv_path)
+        values = df.values.astype(np.float32)
+        self.input_dim = input_dim
+        self.seq_len = seq_len
+
+        if output_mode == "complex_61":
+            expected = input_dim + 2 * seq_len
+            if values.shape[1] < expected:
+                raise ValueError(f"CSV has {values.shape[1]} cols; needs ≥ {expected} (100 + 61 real + 61 imag).")
+            x = values[:, :input_dim]
+            y_real = values[:, input_dim:input_dim+seq_len]
+            y_imag = values[:, input_dim+seq_len:input_dim+2*seq_len]
+        elif output_mode == "mag_only":
+            expected = input_dim + seq_len
+            if values.shape[1] < expected:
+                raise ValueError(f"CSV has {values.shape[1]} cols; needs ≥ {expected} (100 + 61 mag).")
+            x = values[:, :input_dim]
+            y_real = values[:, input_dim:input_dim+seq_len]
+            y_imag = np.zeros_like(y_real)
+        else:
+            raise ValueError("Unsupported output_mode")
+
+        self.X = torch.from_numpy(x)  # (N, 100)
+        self.Y = torch.stack([torch.from_numpy(y_real), torch.from_numpy(y_imag)], dim=-1)  # (N, L, 2)
+
+    def __len__(self):
+        return self.X.size(0)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.Y[idx]
+
+
+# 4) Model definition: GNN encoder + FEDformer-like decoder
+
+def build_grid_adjacency(h=10, w=10):
+    N = h*w
+    A = np.zeros((N, N), dtype=np.float32)
+    def idx(r, c): return r*w + c
+    for r in range(h):
+        for c in range(w):
+            i = idx(r, c)
+            if r > 0:     A[i, idx(r-1, c)] = 1
+            if r < h-1:   A[i, idx(r+1, c)] = 1
+            if c > 0:     A[i, idx(r, c-1)] = 1
+            if c < w-1:   A[i, idx(r, c+1)] = 1
+    A += np.eye(N, dtype=np.float32)
+    D = np.sum(A, axis=1)
+    D_inv_sqrt = np.diag(1.0 / np.sqrt(D + 1e-8))
+    A_norm = D_inv_sqrt @ A @ D_inv_sqrt
+    return torch.from_numpy(A_norm)
+
+class GraphConv(nn.Module):
+    def __init__(self, in_dim, out_dim, A_norm):
+        super().__init__()
+        self.A = A_norm
+        self.lin = nn.Linear(in_dim, out_dim)
+    def forward(self, x):
+        # x: (B, N, F)
+        Ax = torch.einsum("ij,bjf->bif", self.A, x)
+        return F.relu(self.lin(Ax))
+
+class GridGraphEncoder(nn.Module):
+    def __init__(self, d_model=128, node_feat_dim=1, hidden_dims=(32, 64), A_norm=None):
+        super().__init__()
+        self.A = A_norm
+        self.gc1 = GraphConv(node_feat_dim, hidden_dims[0], self.A)
+        self.gc2 = GraphConv(hidden_dims[0], hidden_dims[1], self.A)
+        self.readout = nn.Linear(hidden_dims[1], d_model)
+    def forward(self, geom_bits):
+        B = geom_bits.size(0)
+        x = geom_bits.view(B, 100, 1)
+        h = self.gc1(x)
+        h = self.gc2(h)
+        g = h.mean(dim=1)
+        g = self.readout(g)
+        return g
+
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=2048):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        pos = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
+        div = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        self.register_buffer('pe', pe.unsqueeze(0))
+    def forward(self, x):
+        L = x.size(1)
+        return x + self.pe[:, :L, :]
+
+class SpectralBlock(nn.Module):
+    def __init__(self, d_model, seq_len, top_k=16, ffn_hidden=256):
+        super().__init__()
+        self.d_model = d_model
+        self.seq_len = seq_len
+        self.top_k = min(top_k, seq_len // 2 + 1)
+        self.w_real = nn.Parameter(torch.randn(d_model, self.top_k) * 0.02)
+        self.w_imag = nn.Parameter(torch.randn(d_model, self.top_k) * 0.02)
+        self.ln1 = nn.LayerNorm(d_model)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, ffn_hidden),
+            nn.GELU(),
+            nn.Linear(ffn_hidden, d_model)
+        )
+        self.ln2 = nn.LayerNorm(d_model)
+    def forward(self, x):
+        residual = x
+        B, L, D = x.shape
+        x = self.ln1(x)
+        x_ch = x.transpose(1, 2)      # (B, D, L)
+        X = torch.fft.rfft(x_ch, dim=-1)
+        k = self.top_k
+        idx = torch.arange(k, device=X.device)
+        Xk = X[..., idx]
+        a, b = Xk.real, Xk.imag
+        wr, wi = self.w_real.unsqueeze(0), self.w_imag.unsqueeze(0)
+        real = a * wr - b * wi
+        imag = a * wi + b * wr
+        Xk_mod = torch.complex(real, imag)
+        X_new = torch.zeros_like(X)
+        X_new[..., idx] = Xk_mod
+        x_time = torch.fft.irfft(X_new, n=L, dim=-1).transpose(1, 2)
+        x = residual + x_time
+        y = self.ff(self.ln2(x))
+        return x + y
+
+class FEDformerDecoder(nn.Module):
+    def __init__(self, d_model, seq_len, nhead=8, ffn_hidden=256, num_transformer_layers=2, num_spectral_blocks=2, top_k=16):
+        super().__init__()
+        self.pos = PositionalEncoding(d_model, max_len=seq_len)
+        self.spectral = nn.ModuleList([SpectralBlock(d_model, seq_len, top_k=top_k, ffn_hidden=ffn_hidden) for _ in range(num_spectral_blocks)])
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dim_feedforward=ffn_hidden,
+            batch_first=True, activation="gelu", norm_first=True
+        )
+        self.tr = nn.TransformerEncoder(enc_layer, num_layers=num_transformer_layers)
+        self.head = nn.Linear(d_model, 2)
+    def forward(self, tokens):
+        z = self.pos(tokens)
+        for blk in self.spectral:
+            z = blk(z)
+        z = self.tr(z)
+        out = self.head(z)
+        return out
+
+class Geometry2SParam(nn.Module):
+    def __init__(self, A_norm, seq_len=61, dmodel=128, nhead=8, ffn_hidden=256, num_transformer_layers=2, num_spectral_blocks=2, top_k=16):
+        super().__init__()
+        self.encoder = GridGraphEncoder(d_model=dmodel, node_feat_dim=1, hidden_dims=(32, 64), A_norm=A_norm)
+        self.to_tokens = nn.Linear(dmodel, seq_len * dmodel)
+        self.decoder = FEDformerDecoder(d_model=dmodel, seq_len=seq_len, nhead=nhead, ffn_hidden=ffn_hidden, num_transformer_layers=num_transformer_layers, num_spectral_blocks=num_spectral_blocks, top_k=top_k)
+        self.seq_len = seq_len
+        self.dmodel = dmodel
+    def forward(self, geom_bits):
+        g = self.encoder(geom_bits)
+        tokens = self.to_tokens(g).view(-1, self.seq_len, self.dmodel)
+        yhat = self.decoder(tokens)
+        return yhat  # (B, L, 2)
+
+def complex_mse(pred, target):
+    return F.mse_loss(pred, target)
+
+
+# 5) Training & checkpointing
+import os
+
+def train_model(cfg: Cfg, weights_path: str = "/content/gnn_fedformer_best.pt"):
+    device = get_device(cfg.device)
+    ds = AntennaDataset(cfg.csv_path, input_dim=cfg.input_dim, seq_len=cfg.seq_len, output_mode=cfg.output_mode)
+    n_total = len(ds)
+    n_val = int(cfg.val_split * n_total)
+    n_train = n_total - n_val
+    train_ds, val_ds = random_split(ds, [n_train, n_val], generator=torch.Generator().manual_seed(42))
+
+    train_loader = DataLoader(train_ds, batch_size=cfg.batch_size, shuffle=True)
+    val_loader = DataLoader(val_ds, batch_size=cfg.batch_size, shuffle=False)
+
+    A_norm = build_grid_adjacency(10,10).to(device)
+    model = Geometry2SParam(
+        A_norm=A_norm,
+        seq_len=cfg.seq_len, dmodel=cfg.dmodel, nhead=cfg.nhead, ffn_hidden=cfg.ffn_hidden,
+        num_transformer_layers=cfg.num_transformer_layers, num_spectral_blocks=cfg.num_spectral_blocks, top_k=cfg.top_k_freq
+    ).to(device)
+    opt = torch.optim.Adam(model.parameters(), lr=cfg.lr)
+
+    best_val = float("inf")
+    patience, left = 10, 10
+
+    for epoch in range(1, cfg.epochs+1):
+        model.train()
+        tr_loss = 0.0
+        for xb, yb in train_loader:
+            xb, yb = xb.to(device), yb.to(device)
+            opt.zero_grad()
+            yhat = model(xb)
+            loss = complex_mse(yhat, yb)
+            loss.backward()
+            opt.step()
+            tr_loss += loss.item() * xb.size(0)
+        tr_loss /= max(1, n_train)
+
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for xb, yb in val_loader:
+                xb, yb = xb.to(device), yb.to(device)
+                yhat = model(xb)
+                loss = complex_mse(yhat, yb)
+                val_loss += loss.item() * xb.size(0)
+        val_loss /= max(1, n_val)
+         # >>> ADD THESE TWO LINES <<<
+        hist_epoch.append(epoch)
+        hist_train.append(tr_loss)
+        hist_val.append(val_loss)
+        
+        print(f"Epoch {epoch:03d} | train {tr_loss:.6f} | val {val_loss:.6f}")
+
+        if val_loss < best_val - 1e-6:
+            best_val = val_loss
+            torch.save(model.state_dict(), weights_path)
+            print("  ↳ saved:", weights_path)
+            left = patience
+        else:
+            left -= 1
+            if left <= 0:
+                print("Early stopping.")
+                break
+
+    return weights_path, best_val
+
+
+# 6) Evaluation on a test CSV (optional) or validation metrics
+import numpy as np
+
+@torch.no_grad()
+def evaluate_test(weights_path: str, cfg: Cfg, test_csv: str = None, export_preds_path: str = None, add_notch: bool = True):
+    device = get_device(cfg.device)
+    path = test_csv if test_csv is not None else cfg.csv_path
+    ds = AntennaDataset(path, input_dim=cfg.input_dim, seq_len=cfg.seq_len, output_mode=cfg.output_mode)
+    loader = DataLoader(ds, batch_size=cfg.batch_size, shuffle=False)
+
+    A_norm = build_grid_adjacency(10,10).to(device)
+    model = Geometry2SParam(
+        A_norm=A_norm,
+        seq_len=cfg.seq_len, dmodel=cfg.dmodel, nhead=cfg.nhead, ffn_hidden=cfg.ffn_hidden,
+        num_transformer_layers=cfg.num_transformer_layers, num_spectral_blocks=cfg.num_spectral_blocks, top_k=cfg.top_k_freq
+    ).to(device)
+    state = torch.load(weights_path, map_location=device)
+    model.load_state_dict(state)
+    model.eval()
+
+    total_complex_mse, total_mag_rmse_db, n_samples = 0.0, 0.0, 0
+    all_pred_real, all_pred_imag = [], []
+
+    for xb, yb in loader:
+        xb, yb = xb.to(device), yb.to(device)
+        yhat = model(xb)
+
+        loss = F.mse_loss(yhat, yb, reduction="none").mean(dim=(1,2))
+        total_complex_mse += loss.sum().item()
+
+        pred_c = torch.complex(yhat[...,0], yhat[...,1])
+        true_c = torch.complex(yb[...,0],   yb[...,1])
+        pred_db = 20.0*torch.log10(torch.abs(pred_c).clamp_min(1e-12))
+        true_db = 20.0*torch.log10(torch.abs(true_c).clamp_min(1e-12))
+        rmse_db = torch.sqrt(((pred_db-true_db)**2).mean(dim=1))
+        total_mag_rmse_db += rmse_db.sum().item()
+
+        n_samples += xb.size(0)
+
+        if export_preds_path is not None:
+            all_pred_real.append(yhat[...,0].cpu())
+            all_pred_imag.append(yhat[...,1].cpu())
+
+    results = {
+        "complex_mse": total_complex_mse / max(1, n_samples),
+        "mag_rmse_db": total_mag_rmse_db / max(1, n_samples),
+    }
+
+    if add_notch:
+        freq = np.linspace(cfg.freq_hz_start, cfg.freq_hz_stop, cfg.seq_len)
+        notch_shifts = []
+        for xb, yb in loader:
+            xb, yb = xb.to(device), yb.to(device)
+            yhat = model(xb)
+            pred_db = 20.0*torch.log10(torch.abs(torch.complex(yhat[...,0], yhat[...,1])).clamp_min(1e-12))
+            true_db = 20.0*torch.log10(torch.abs(torch.complex(yb[...,0], yb[...,1])).clamp_min(1e-12))
+            pred_idx = pred_db.argmin(dim=1).cpu().numpy()
+            true_idx = true_db.argmin(dim=1).cpu().numpy()
+            notch_shifts.extend(np.abs(freq[pred_idx]-freq[true_idx]).tolist())
+        results["notch_shift_hz_mean"] = float(np.mean(notch_shifts))
+        results["notch_shift_hz_median"] = float(np.median(notch_shifts))
+
+    if export_preds_path is not None:
+        pred_real = torch.cat(all_pred_real, dim=0).numpy()
+        pred_imag = torch.cat(all_pred_imag, dim=0).numpy()
+        cols = [f"real_{i}" for i in range(pred_real.shape[1])] + [f"imag_{i}" for i in range(pred_imag.shape[1])]
+        arr = np.concatenate([pred_real, pred_imag], axis=1)
+        import pandas as pd
+        pd.DataFrame(arr, columns=cols).to_csv(export_preds_path, index=False)
+
+    return results
+
+
+
+# 7) Inference helper
+class AntennaPredictor:
+    def __init__(self, weights_path: str, cfg: Cfg):
+        self.cfg = cfg
+        self.device = get_device(cfg.device)
+        self.A = build_grid_adjacency(10,10).to(self.device)
+        self.model = Geometry2SParam(
+            A_norm=self.A,
+            seq_len=cfg.seq_len, dmodel=cfg.dmodel, nhead=cfg.nhead, ffn_hidden=cfg.ffn_hidden,
+            num_transformer_layers=cfg.num_transformer_layers, num_spectral_blocks=cfg.num_spectral_blocks, top_k=cfg.top_k_freq
+        ).to(self.device)
+        state = torch.load(weights_path, map_location=self.device)
+        self.model.load_state_dict(state)
+        self.model.eval()
+        self.freq = np.linspace(cfg.freq_hz_start, cfg.freq_hz_stop, cfg.seq_len)
+
+    @torch.no_grad()
+    def predict(self, geom_bits_100):
+        x = torch.tensor(np.asarray(geom_bits_100, dtype=np.float32)).view(1, -1).to(self.device)
+        yhat = self.model(x)  # (1, L, 2)
+        real = yhat[...,0].cpu().numpy()[0]
+        imag = yhat[...,1].cpu().numpy()[0]
+        mag = np.sqrt(real**2 + imag**2)
+        s11_db = 20.0*np.log10(np.clip(mag, 1e-12, None))
+        return {"freq_hz": self.freq, "real": real, "imag": imag, "s11_db": s11_db}
+
+
+
+# --- Add this just BEFORE calling train_model(CFG, ...) ---
+
+import matplotlib.pyplot as plt
+
+hist_epoch = []
+hist_train = []
+hist_val   = []
+
+# 8) Train
+# If you haven't uploaded CSVs, consider the tiny dataset assignments above.
+weights_path, best_val = train_model(CFG, weights_path="/content/gnn_fedformer_best.pt")
+
+# --- Plot loss vs. epoch ---
+plt.figure()
+plt.plot(hist_epoch, hist_train, label="Train")
+plt.plot(hist_epoch, hist_val,   label="Validation")
+plt.xlabel("Epoch")
+plt.ylabel("Loss (Complex MSE)")
+plt.title("Training / Validation Loss vs. Epoch")
+plt.grid(True)
+plt.legend()
+plt.tight_layout()
+# Optionally save
+# plt.savefig("/content/loss_vs_epoch.png", dpi=150, bbox_inches="tight")
+plt.show()
+
+print("Best validation loss:", best_val)
+
+
+# 9) Evaluate (on test CSV if provided; else on train CSV stats)
+test_csv = CFG.test_csv_path if os.path.exists(CFG.test_csv_path) else None
+res = evaluate_test(weights_path="/content/gnn_fedformer_best.pt", cfg=CFG, test_csv=test_csv, export_preds_path="/content/preds.csv", add_notch=True)
+res
+
+
+from plot_training_history import plot_from_log
+fig = plot_from_log("train.log", title="Loss vs Epoch", save_path="loss_vs_epoch.png")
+
+
+from plot_training_history import plot_from_log
+fig = plot_from_log("train.log", title="Loss vs Epoch", save_path="loss_vs_epoch.png")

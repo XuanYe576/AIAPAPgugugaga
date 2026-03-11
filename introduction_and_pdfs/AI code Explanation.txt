@@ -1,0 +1,511 @@
+Got it, Iman. Here’s a clear, line-by-line walkthrough, grouped in tiny blocks so it’s readable. I’ll note tensor shapes and what each line does.
+
+---
+
+# Config & imports
+
+```python
+import math
+import pandas as pd
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, random_split
+```
+
+* Standard Python/ML imports. `torch.nn` for modules, `F` for functional ops, `DataLoader` utilities for batching.
+
+```python
+CSV_PATH = "data.csv"        # <-- set your CSV path
+INPUT_DIM = 100              # 10x10 geometry bits
+SEQ_LEN = 61                 # number of S-parameter frequency samples
+BATCH_SIZE = 64
+LR = 1e-3
+EPOCHS = 50
+VAL_SPLIT = 0.2
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+```
+
+* Training/config hyperparameters.
+* `INPUT_DIM=100` (10×10 flattened geometry).
+* `SEQ_LEN=61` frequency points.
+* `DEVICE` picks GPU if available.
+
+```python
+OUTPUT_MODE = "complex_61"   # change to "mag_only" if you only have 61 outputs
+```
+
+* Controls how the CSV labels are interpreted: real+imag (preferred) vs magnitude only.
+
+```python
+DMODEL = 128
+NHEAD = 8
+FFN_HIDDEN = 256
+NUM_TRANSFORMER_LAYERS = 2
+NUM_SPECTRAL_BLOCKS = 2
+TOP_K_FREQ = 16
+```
+
+* Model sizes. `DMODEL` is the token/channel width.
+* `TOP_K_FREQ` = number of low-frequency modes for spectral mixing (FEDformer-ish idea).
+
+---
+
+# Dataset
+
+```python
+class AntennaDataset(Dataset):
+    def __init__(self, csv_path, output_mode="complex_61"):
+        df = pd.read_csv(csv_path)
+        values = df.values.astype(np.float32)
+```
+
+* Load the CSV with pandas; convert to `float32` (PyTorch friendly).
+
+```python
+        if output_mode == "complex_61":
+            expected_cols = INPUT_DIM + 2 * SEQ_LEN
+            if values.shape[1] < expected_cols:
+                raise ValueError(...)
+            x = values[:, :INPUT_DIM]                      
+            y_real = values[:, INPUT_DIM:INPUT_DIM+SEQ_LEN]  
+            y_imag = values[:, INPUT_DIM+SEQ_LEN:INPUT_DIM+2*SEQ_LEN]  
+```
+
+* When labels are complex, the CSV must contain 100 inputs + 61 real + 61 imag.
+* Split columns accordingly.
+
+```python
+        elif output_mode == "mag_only":
+            expected_cols = INPUT_DIM + SEQ_LEN
+            if values.shape[1] < expected_cols:
+                raise ValueError(...)
+            x = values[:, :INPUT_DIM]
+            y_real = values[:, INPUT_DIM:INPUT_DIM+SEQ_LEN]
+            y_imag = np.zeros_like(y_real)
+```
+
+* Magnitude-only fallback: treat magnitudes as real part; imag set to zero (still trains with complex loss format).
+
+```python
+        self.X = torch.from_numpy(x)  # (N, 100)
+        self.Y = torch.stack([
+            torch.from_numpy(y_real),
+            torch.from_numpy(y_imag)
+        ], dim=-1)  # (N, 61, 2)
+```
+
+* Convert to tensors. `Y` last dim=2 packs `[real, imag]`.
+
+```python
+    def __len__(self): return self.X.size(0)
+    def __getitem__(self, idx): return self.X[idx], self.Y[idx]
+```
+
+* Standard PyTorch Dataset interface.
+
+---
+
+# Grid graph (10×10) adjacency
+
+```python
+def build_grid_adjacency(h=10, w=10):
+    N = h*w
+    A = np.zeros((N, N), dtype=np.float32)
+```
+
+* Create an `N×N` adjacency matrix for a 10×10 grid (N=100).
+
+```python
+    def idx(r, c): return r*w + c
+    for r in range(h):
+        for c in range(w):
+            i = idx(r, c)
+            if r > 0:     A[i, idx(r-1, c)] = 1
+            if r < h-1:   A[i, idx(r+1, c)] = 1
+            if c > 0:     A[i, idx(r, c-1)] = 1
+            if c < w-1:   A[i, idx(r, c+1)] = 1
+```
+
+* 4-neighborhood connectivity (up/down/left/right).
+
+```python
+    A += np.eye(N, dtype=np.float32)
+```
+
+* Add self-loops.
+
+```python
+    D = np.sum(A, axis=1)
+    D_inv_sqrt = np.diag(1.0 / np.sqrt(D + 1e-8))
+    A_norm = D_inv_sqrt @ A @ D_inv_sqrt
+    return torch.from_numpy(A_norm)
+```
+
+* Symmetric normalization $\hat{A} = D^{-1/2} A D^{-1/2}$ (standard GCN trick).
+* Return as torch tensor.
+
+---
+
+# Simple Graph Convolution
+
+```python
+class GraphConv(nn.Module):
+    def __init__(self, in_dim, out_dim, A_norm):
+        super().__init__()
+        self.A = A_norm
+        self.lin = nn.Linear(in_dim, out_dim)
+```
+
+* Graph conv layer: multiply by normalized adjacency, then a linear.
+
+```python
+    def forward(self, x):
+        # x: (B, N, F)
+        Ax = torch.einsum("ij,bjf->bif", self.A, x)  # (B, N, F)
+        return F.relu(self.lin(Ax))
+```
+
+* `einsum` applies $\hat{A}x$ per batch.
+* Linear projects features from `in_dim`→`out_dim`; ReLU nonlinearity.
+
+---
+
+# GridGraphEncoder (2 GCN layers + pooling)
+
+```python
+class GridGraphEncoder(nn.Module):
+    def __init__(self, node_feat_dim=1, hidden_dims=(32, 64), A_norm=None):
+        super().__init__()
+        self.A = A_norm
+        self.gc1 = GraphConv(node_feat_dim, hidden_dims[0], self.A)
+        self.gc2 = GraphConv(hidden_dims[0], hidden_dims[1], self.A)
+        self.readout = nn.Linear(hidden_dims[1], DMODEL)
+```
+
+* Two GCN layers to embed each node; then a linear “readout” to `DMODEL`.
+
+```python
+    def forward(self, geom_bits):
+        B = geom_bits.size(0)
+        x = geom_bits.view(B, 100, 1)  # (B, N, 1) node features=bit
+        h = self.gc1(x)                # (B, N, 32)
+        h = self.gc2(h)                # (B, N, 64)
+        g = h.mean(dim=1)              # global mean pool → (B, 64)
+        g = self.readout(g)            # (B, DMODEL)
+        return g
+```
+
+* Reshape flat 100-vector into per-node features.
+* GCN→GCN→global mean pooling→linear → global geometry embedding `(B, DMODEL)`.
+
+---
+
+# FEDformer-ish Spectral Block
+
+```python
+class SpectralBlock(nn.Module):
+    def __init__(self, d_model, seq_len, top_k=16, ffn_hidden=256):
+        super().__init__()
+        self.d_model = d_model
+        self.seq_len = seq_len
+        self.top_k = min(top_k, seq_len // 2 + 1)
+```
+
+* Keep only the first `top_k` low-frequency modes (from RFFT output length `L//2+1`).
+
+```python
+        self.w_real = nn.Parameter(torch.randn(d_model, self.top_k) * 0.02)
+        self.w_imag = nn.Parameter(torch.randn(d_model, self.top_k) * 0.02)
+```
+
+* Learnable complex weights per channel & frequency mode (real/imag parts).
+
+```python
+        self.ln1 = nn.LayerNorm(d_model)
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, ffn_hidden),
+            nn.GELU(),
+            nn.Linear(ffn_hidden, d_model)
+        )
+        self.ln2 = nn.LayerNorm(d_model)
+```
+
+* Pre-norm + position-wise feed-forward (residual MLP).
+
+```python
+    def forward(self, x):
+        residual = x
+        B, L, D = x.shape
+        x = self.ln1(x)
+        x_ch_first = x.transpose(1, 2)  # (B, D, L)
+        X = torch.fft.rfft(x_ch_first, dim=-1)  # (B, D, Lr) complex
+```
+
+* Normalize; switch to (B, channels, length); real FFT along length.
+
+```python
+        Lr = X.size(-1)
+        k = self.top_k
+        idx = torch.arange(k, device=X.device)
+        Xk = X[..., idx]               # (B, D, k)
+```
+
+* Select the first `k` low-frequency bins.
+
+```python
+        a = Xk.real
+        b = Xk.imag
+        wr = self.w_real.unsqueeze(0)  # (1, D, k)
+        wi = self.w_imag.unsqueeze(0)  # (1, D, k)
+        real = a * wr - b * wi
+        imag = a * wi + b * wr
+        Xk_mod = torch.complex(real, imag)  # (B, D, k)
+```
+
+* Complex scaling per mode: $(a+jb)\cdot(w_r+jw_i)$.
+
+```python
+        X_new = torch.zeros_like(X)
+        X_new[..., idx] = Xk_mod
+```
+
+* Keep modified low-freqs; zero high-freqs (a learned low-pass).
+
+```python
+        x_time = torch.fft.irfft(X_new, n=L, dim=-1)  # (B, D, L)
+        x_time = x_time.transpose(1, 2)  # (B, L, D)
+        x = residual + x_time            # residual
+```
+
+* Back to time domain; add residual.
+
+```python
+        y = self.ff(self.ln2(x))
+        return x + y
+```
+
+* MLP with residual (pre-norm).
+
+---
+
+# Decoder (Spectral blocks + Transformer)
+
+```python
+class FEDformerDecoder(nn.Module):
+    def __init__(...):
+        super().__init__()
+        self.pos_encoding = PositionalEncoding(d_model, max_len=seq_len)
+```
+
+* Sine/cos positional encoding for sequence order.
+
+```python
+        self.spectral = nn.ModuleList([
+            SpectralBlock(d_model, seq_len, top_k=top_k, ffn_hidden=ffn_hidden)
+            for _ in range(num_spectral_blocks)
+        ])
+```
+
+* Stack of spectral (Fourier) blocks.
+
+```python
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, nhead=nhead, dimfeedforward=ffn_hidden,
+            batch_first=True, activation="gelu", norm_first=True
+        )
+        self.tr = nn.TransformerEncoder(encoder_layer, num_layers=num_transformer_layers)
+```
+
+* Standard Transformer encoder (self-attention) after spectral mixing.
+
+```python
+        self.head = nn.Linear(d_model, 2)
+```
+
+* Final projection to 2 channels per time step → `[real, imag]`.
+
+```python
+    def forward(self, tokens):
+        z = self.pos_encoding(tokens)   # (B, L, D)
+        for blk in self.spectral:
+            z = blk(z)
+        z = self.tr(z)                  # (B, L, D)
+        out = self.head(z)              # (B, L, 2)
+        return out
+```
+
+* Apply PE → spectral blocks → Transformer → linear head to complex outputs.
+
+---
+
+# Positional encoding
+
+```python
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=2048):
+        super().__init__()
+        pe = torch.zeros(max_len, d_model)
+        pos = torch.arange(0, max_len, dtype=torch.float32).unsqueeze(1)
+        div = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(pos * div)
+        pe[:, 1::2] = torch.cos(pos * div)
+        self.register_buffer('pe', pe.unsqueeze(0))
+```
+
+* Precompute sinusoidal table $(1, \text{max\_len}, d)$ and store as non-trainable buffer.
+
+```python
+    def forward(self, x):
+        L = x.size(1)
+        return x + self.pe[:, :L, :]
+```
+
+* Add PE to input tokens.
+
+---
+
+# Full model wrapper
+
+```python
+class Geometry2SParam(nn.Module):
+    def __init__(self, A_norm, seq_len=61):
+        super().__init__()
+        self.encoder = GridGraphEncoder(node_feat_dim=1, hidden_dims=(32, 64), A_norm=A_norm)
+        self.to_tokens = nn.Linear(DMODEL, seq_len * DMODEL)
+        self.decoder = FEDformerDecoder(...)
+```
+
+* Compose encoder + a linear that expands the global vector into `L` tokens + the decoder.
+
+```python
+    def forward(self, geom_bits):
+        g = self.encoder(geom_bits)                        # (B, D)
+        tokens = self.to_tokens(g).view(-1, SEQ_LEN, DMODEL)  # (B, L, D)
+        yhat = self.decoder(tokens)                        # (B, L, 2)
+        return yhat
+```
+
+* Produce the whole S-parameter sequence conditioned on geometry embedding.
+
+---
+
+# Loss
+
+```python
+def complex_mse(pred, target):
+    # pred, target: (B, L, 2) with [..., 0]=real, [..., 1]=imag
+    return F.mse_loss(pred, target)
+```
+
+* MSE over both real & imag channels (equivalent to complex MSE with equal weighting).
+
+---
+
+# Train / eval loop
+
+```python
+def main():
+    ds = AntennaDataset(CSV_PATH, output_mode=OUTPUT_MODE)
+    n_total = len(ds)
+    n_val = int(VAL_SPLIT * n_total)
+    n_train = n_total - n_val
+    train_ds, val_ds = random_split(ds, [n_train, n_val], generator=torch.Generator().manual_seed(42))
+```
+
+* Build dataset and split into train/val with a fixed seed for reproducibility.
+
+```python
+    train_loader = DataLoader(train_ds, batch_size=BATCH_SIZE, shuffle=True, drop_last=False)
+    val_loader = DataLoader(val_ds, batch_size=BATCH_SIZE, shuffle=False, drop_last=False)
+```
+
+* Dataloaders for batching.
+
+```python
+    A_norm = build_grid_adjacency(10, 10).to(DEVICE)
+```
+
+* Precompute and move normalized adjacency to device.
+
+```python
+    model = Geometry2SParam(A_norm=A_norm, seq_len=SEQ_LEN).to(DEVICE)
+    opt = torch.optim.Adam(model.parameters(), lr=LR)
+    best_val = float("inf")
+```
+
+* Instantiate model + Adam optimizer. Track best validation loss.
+
+```python
+    for epoch in range(1, EPOCHS + 1):
+        model.train()
+        tr_loss = 0.0
+        for xb, yb in train_loader:
+            xb = xb.to(DEVICE)
+            yb = yb.to(DEVICE)
+            opt.zero_grad()
+            yhat = model(xb)          # (B, L, 2)
+            loss = complex_mse(yhat, yb)
+            loss.backward()
+            opt.step()
+            tr_loss += loss.item() * xb.size(0)
+        tr_loss /= n_train
+```
+
+* Standard training loop: forward → loss → backprop → optimizer step → accumulate mean train loss.
+
+```python
+        model.eval()
+        with torch.no_grad():
+            val_loss = 0.0
+            for xb, yb in val_loader:
+                xb = xb.to(DEVICE)
+                yb = yb.to(DEVICE)
+                yhat = model(xb)
+                loss = complex_mse(yhat, yb)
+                val_loss += loss.item() * xb.size(0)
+            val_loss /= max(1, n_val)
+```
+
+* Disable gradients; compute mean validation loss.
+
+```python
+        print(f"Epoch {epoch:03d} | train {tr_loss:.6f} | val {val_loss:.6f}")
+```
+
+* Progress log.
+
+```python
+        if val_loss < best_val:
+            best_val = val_loss
+            torch.save(model.state_dict(), "gnn_fedformer_best.pt")
+```
+
+* Save the best model checkpoint.
+
+```python
+    print("Training complete. Best val:", best_val)
+```
+
+* Final summary.
+
+```python
+if __name__ == "__main__":
+    main()
+```
+
+* Entrypoint for running as a script.
+
+---
+
+## Quick mental model of the pipeline
+
+1. **Input (B, 100)** binary geometry → reshape to (B, 100, 1) nodes on a 10×10 grid.
+2. **GCN ×2** with normalized adjacency → **global mean pool** → **(B, DMODEL)** embedding.
+3. **Linear** expands embedding to **(B, 61, DMODEL)** “tokens.”
+4. **Spectral blocks** (learned low-frequency mixing) + **Transformer encoder** (self-attention across frequency).
+5. **Head** projects each of 61 tokens to **2 channels** → real & imag of $S_{11}(f)$.
+6. **Loss**: MSE on $[ \Re, \Im ]$ across all 61 points.
+
+If you want, I can tailor this to multi-port $S_{ij}$ (e.g., output shape `(B, 61, 2*P*P)` or a separate head per port pair) and add the physics-aware penalties (passivity/reciprocity) we discussed earlier.

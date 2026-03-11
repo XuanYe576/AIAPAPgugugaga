@@ -1,0 +1,5 @@
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
+results/patch_antenna_ai_r5/
