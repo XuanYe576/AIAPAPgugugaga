@@ -24,6 +24,7 @@ import json
 import math
 import random
 import re
+import sys
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -64,10 +65,14 @@ except ModuleNotFoundError:
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 GRID_HEIGHT = 10
 GRID_WIDTH = 10
 NUM_CELLS = GRID_HEIGHT * GRID_WIDTH
 RAW_DATA_ROOT = REPO_ROOT / "Data" / "Patch Antennas 6,001-30,000-selected"
+
+from metrics.prediction_graphs import save_scalar_prediction_graphs
 
 
 def _default_geometry_catalog_path() -> Path:
@@ -135,10 +140,12 @@ class Config:
     max_antennas: int = 0
     device: str = "auto"
     eval_split: str = ""
+    prediction_plot_count: int = 12
     overwrite_processed: bool = False
     weights_filename: str = "r5pinn_perF_best.pt"
     checkpoint_filename: str = "r5pinn_perF_best.ckpt"
     history_filename: str = "history.csv"
+    loss_per_freq_filename: str = "loss_per_freq.csv"
     summary_filename: str = "summary.json"
     config_filename: str = "config.json"
 
@@ -151,6 +158,10 @@ class Config:
         return self.results_dir / self.history_filename
 
     @property
+    def loss_per_freq_path(self) -> Path:
+        return self.results_dir / self.loss_per_freq_filename
+
+    @property
     def summary_path(self) -> Path:
         return self.results_dir / self.summary_filename
 
@@ -161,6 +172,10 @@ class Config:
     @property
     def checkpoint_path(self) -> Path:
         return self.results_dir / self.checkpoint_filename
+
+    @property
+    def prediction_graphical_dir(self) -> Path:
+        return self.results_dir / "weight" / "graphical"
 
 
 @dataclass(frozen=True)
@@ -459,14 +474,17 @@ class PerFrequencyDataset(Dataset):
     def __len__(self) -> int:
         return len(self.antenna_indices) * self.seq_len
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(
+        self,
+        idx: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
         antenna_slot, freq_idx = divmod(idx, self.seq_len)
         antenna_idx = self.antenna_indices[antenna_slot]
         geom_bits = self.base.geometry[antenna_idx]
         freq_norm = self.base.freq_axis_norm[freq_idx].view(1)
         target_db = self.base.curves_db[antenna_idx, freq_idx]
         weight = self.base.sample_weights[antenna_idx, freq_idx]
-        return geom_bits, freq_norm, target_db, weight
+        return geom_bits, freq_norm, target_db, weight, freq_idx
 
 
 def build_geometry_graph(
@@ -494,8 +512,8 @@ def build_geometry_graph(
         neighbors = [src for src in order if src != dst][:k_neighbors]
         neighbors.insert(0, dst)
         for src in neighbors:
-            dx = float(x01[src] - x01[dst])
-            dy = float(y01[src] - y01[dst])
+            dx = float(x01[src, 0] - x01[dst, 0])
+            dy = float(y01[src, 0] - y01[dst, 0])
             dist = math.sqrt(dx * dx + dy * dy)
             if dist > 1e-12:
                 cos_theta = dx / dist
@@ -692,16 +710,30 @@ class R5PINNPerFrequency(nn.Module):
         return self.head(fused).squeeze(-1)
 
 
+def pointwise_physics_terms(
+    pred_db: torch.Tensor,
+    target_db: torch.Tensor,
+    weights: torch.Tensor,
+    cfg: Config,
+) -> PointLossBreakdown:
+    data = weights * F.smooth_l1_loss(pred_db, target_db, reduction="none")
+    passive = torch.relu(pred_db).pow(2)
+    total = data + cfg.loss_passive * passive
+    return PointLossBreakdown(total=total, data=data, passive=passive)
+
+
 def pointwise_physics_loss(
     pred_db: torch.Tensor,
     target_db: torch.Tensor,
     weights: torch.Tensor,
     cfg: Config,
 ) -> PointLossBreakdown:
-    data = (weights * F.smooth_l1_loss(pred_db, target_db, reduction="none")).mean()
-    passive = torch.relu(pred_db).pow(2).mean()
-    total = data + cfg.loss_passive * passive
-    return PointLossBreakdown(total=total, data=data, passive=passive)
+    pointwise = pointwise_physics_terms(pred_db, target_db, weights, cfg)
+    return PointLossBreakdown(
+        total=pointwise.total.mean(),
+        data=pointwise.data.mean(),
+        passive=pointwise.passive.mean(),
+    )
 
 
 def infer_family_key(bits: torch.Tensor) -> tuple[int, ...]:
@@ -811,7 +843,7 @@ def evaluate_model(
     totals = {"total": 0.0, "data": 0.0, "passive": 0.0, "mae": 0.0}
     count = 0
     with torch.no_grad():
-        for geom_bits, freq_norm, target_db, weights in loader:
+        for geom_bits, freq_norm, target_db, weights, _freq_idx in loader:
             geom_bits = geom_bits.to(device)
             freq_norm = freq_norm.to(device)
             target_db = target_db.to(device)
@@ -869,14 +901,27 @@ def train_model(cfg: Config) -> dict[str, float]:
                 "val_mae",
             ]
         )
+    with cfg.loss_per_freq_path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            [
+                "epoch",
+                *[
+                    f"freq_{float(freq_ghz):.6f}_ghz"
+                    for freq_ghz in base.freq_axis_ghz.tolist()
+                ],
+            ]
+        )
 
     for epoch in range(1, cfg.epochs + 1):
         model.train()
         train_totals = {"total": 0.0, "data": 0.0, "passive": 0.0}
+        per_freq_loss_sums = torch.zeros(base.seq_len, dtype=torch.float64)
+        per_freq_loss_counts = torch.zeros(base.seq_len, dtype=torch.long)
         count = 0
         amp_enabled = device == "cuda" and cfg.use_amp
 
-        for batch_idx, (geom_bits, freq_norm, target_db, weights) in enumerate(
+        for batch_idx, (geom_bits, freq_norm, target_db, weights, freq_idx) in enumerate(
             train_loader,
             start=1,
         ):
@@ -884,11 +929,17 @@ def train_model(cfg: Config) -> dict[str, float]:
             freq_norm = freq_norm.to(device)
             target_db = target_db.to(device)
             weights = weights.to(device)
+            freq_idx = freq_idx.to(dtype=torch.long)
 
             optimizer.zero_grad(set_to_none=True)
             with torch.cuda.amp.autocast(enabled=amp_enabled):
                 pred_db = model(geom_bits, freq_norm)
-                losses = pointwise_physics_loss(pred_db, target_db, weights, cfg)
+                pointwise = pointwise_physics_terms(pred_db, target_db, weights, cfg)
+                losses = PointLossBreakdown(
+                    total=pointwise.total.mean(),
+                    data=pointwise.data.mean(),
+                    passive=pointwise.passive.mean(),
+                )
 
             scaler.scale(losses.total).backward()
             scaler.unscale_(optimizer)
@@ -900,6 +951,16 @@ def train_model(cfg: Config) -> dict[str, float]:
             train_totals["total"] += losses.total.item() * batch_size
             train_totals["data"] += losses.data.item() * batch_size
             train_totals["passive"] += losses.passive.item() * batch_size
+            per_freq_loss_sums.index_add_(
+                0,
+                freq_idx,
+                pointwise.total.detach().to(device="cpu", dtype=torch.float64),
+            )
+            per_freq_loss_counts.index_add_(
+                0,
+                freq_idx,
+                torch.ones_like(freq_idx, dtype=torch.long),
+            )
             count += batch_size
 
             if cfg.log_every_batches > 0 and batch_idx % cfg.log_every_batches == 0:
@@ -916,6 +977,11 @@ def train_model(cfg: Config) -> dict[str, float]:
 
         train_metrics = {key: value / max(1, count) for key, value in train_totals.items()}
         val_metrics = evaluate_model(model, val_loader, cfg, device)
+        counts_np = per_freq_loss_counts.numpy()
+        sums_np = per_freq_loss_sums.numpy()
+        avg_loss_per_freq = np.full(base.seq_len, np.nan, dtype=np.float64)
+        observed = counts_np > 0
+        avg_loss_per_freq[observed] = sums_np[observed] / counts_np[observed]
         row = {
             "epoch": epoch,
             "train_total": train_metrics["total"],
@@ -942,6 +1008,9 @@ def train_model(cfg: Config) -> dict[str, float]:
                     row["val_mae"],
                 ]
             )
+        with cfg.loss_per_freq_path.open("a", newline="", encoding="utf-8") as handle:
+            writer = csv.writer(handle)
+            writer.writerow([epoch, *avg_loss_per_freq.tolist()])
 
         print(
             "Epoch "
@@ -966,6 +1035,16 @@ def train_model(cfg: Config) -> dict[str, float]:
     best_model = build_model(cfg, device)
     load_model_weights(best_model, cfg.checkpoint_path, device)
     test_metrics = evaluate_model(best_model, test_loader, cfg, device)
+    _, _, test_idx = family_aware_split_indices(base, cfg)
+    graphical_dir = save_scalar_prediction_graphs(
+        model=best_model,
+        base=base,
+        antenna_indices=test_idx,
+        output_dir=cfg.prediction_graphical_dir / "test",
+        split="test",
+        plot_count=cfg.prediction_plot_count,
+        device=device,
+    )
     summary = {
         "best_epoch": best_epoch,
         "best_val_total": best_val,
@@ -975,6 +1054,8 @@ def train_model(cfg: Config) -> dict[str, float]:
         "test_mae": test_metrics["mae"],
         "num_antennas": len(base),
         "seq_len": base.seq_len,
+        "prediction_graphical_dir": str(graphical_dir),
+        "prediction_graph_count": min(cfg.prediction_plot_count, len(test_idx)),
     }
     with cfg.summary_path.open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
@@ -996,13 +1077,26 @@ def run_saved_evaluation(cfg: Config, split: str) -> dict[str, float]:
         cfg.processed_meta_path,
         sigma_db=cfg.notch_sigma_db,
     )
+    _train_idx, val_idx, test_idx = family_aware_split_indices(base, cfg)
     train_loader, val_loader, test_loader = build_dataloaders(base, cfg, device)
     loader = val_loader if split == "val" else test_loader
+    antenna_indices = val_idx if split == "val" else test_idx
     model = build_model(cfg, device)
     load_model_weights(model, cfg.checkpoint_path, device)
     metrics = evaluate_model(model, loader, cfg, device)
+    graphical_dir = save_scalar_prediction_graphs(
+        model=model,
+        base=base,
+        antenna_indices=antenna_indices,
+        output_dir=cfg.prediction_graphical_dir / split,
+        split=split,
+        plot_count=cfg.prediction_plot_count,
+        device=device,
+    )
     metrics["split"] = split
     metrics["checkpoint"] = str(cfg.checkpoint_path)
+    metrics["graphical_dir"] = str(graphical_dir)
+    metrics["prediction_graph_count"] = min(cfg.prediction_plot_count, len(antenna_indices))
     return metrics
 
 
@@ -1047,6 +1141,7 @@ def parse_args() -> Config:
     parser.add_argument("--device", type=str, default=cfg.device)
     parser.add_argument("--log-every-batches", type=int, default=cfg.log_every_batches)
     parser.add_argument("--eval-split", choices=["val", "test"])
+    parser.add_argument("--prediction-plot-count", type=int, default=cfg.prediction_plot_count)
     parser.add_argument("--overwrite-processed", action="store_true")
     args = parser.parse_args()
 
@@ -1065,6 +1160,7 @@ def parse_args() -> Config:
     cfg.device = args.device
     cfg.log_every_batches = args.log_every_batches
     cfg.eval_split = args.eval_split or ""
+    cfg.prediction_plot_count = max(0, args.prediction_plot_count)
     cfg.overwrite_processed = args.overwrite_processed
     return cfg
 
@@ -1107,6 +1203,7 @@ def main() -> None:
         return
 
     summary = train_model(cfg)
+    print(f"Prediction graphs saved to: {summary['prediction_graphical_dir']}")
     print("Training summary:")
     for key, value in summary.items():
         print(f"  {key}: {value}")

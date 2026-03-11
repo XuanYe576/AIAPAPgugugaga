@@ -15,7 +15,7 @@ layout flags, but the default target structure is the full 122-point complex
 response.
 
 For the uploaded magnitude-only raw data split into geometry catalogs and
-per-patch S11 curves, use `Model/PINN/R5PINN_perF.py` or the surface
+per-patch S11 curves, use `Model/Pinn/R5PINN_perF.py` or the surface
 `main.py --usepinn` entry point.
 """
 
@@ -26,14 +26,16 @@ import csv
 import json
 import math
 import random
+import sys
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 
-import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import torch
@@ -41,6 +43,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, Dataset, Subset
+
+from metrics.prediction_graphs import plot_loss_curve, save_complex_prediction_graphs
 
 GRID_HEIGHT = 10
 GRID_WIDTH = 10
@@ -113,6 +117,7 @@ class Config:
     passive_limit: float = 1.0
     device: str = "auto"
     eval_split: str = ""
+    prediction_plot_count: int = 12
     output_dir: Path = field(default_factory=_default_output_dir)
     weights_filename: str = "gnn_fedformer_r5_full_best.pt"
     checkpoint_filename: str = "gnn_fedformer_r5_full_best.ckpt"
@@ -140,6 +145,10 @@ class Config:
     @property
     def checkpoint_path(self) -> Path:
         return self.output_dir / self.checkpoint_filename
+
+    @property
+    def prediction_graphical_dir(self) -> Path:
+        return self.output_dir / "weight" / "graphical"
 
 
 @dataclass(frozen=True)
@@ -1162,6 +1171,16 @@ def train_model(cfg: Config) -> tuple[dict[str, float], list[dict[str, float]]]:
     best_model = build_model(cfg, device)
     load_model_weights(best_model, cfg.checkpoint_path, device)
     test_metrics = evaluate_model(best_model, test_loader, cfg, device, best_epoch)
+    graphical_dir = save_complex_prediction_graphs(
+        model=best_model,
+        loader=test_loader,
+        freq_axis_hz=freq_axis_hz,
+        gamma_db_fn=gamma_db,
+        output_dir=cfg.prediction_graphical_dir / "test",
+        split="test",
+        plot_count=cfg.prediction_plot_count,
+        device=device,
+    )
     summary = {
         "best_epoch": best_epoch,
         "best_val_total": best_val,
@@ -1173,6 +1192,8 @@ def train_model(cfg: Config) -> tuple[dict[str, float], list[dict[str, float]]]:
         "test_smooth": test_metrics["smooth"],
         "layout": dataset.layout.name,
         "seq_len": dataset.seq_len,
+        "prediction_graphical_dir": str(graphical_dir),
+        "prediction_graph_count": min(cfg.prediction_plot_count, len(test_loader.dataset)),
     }
     write_summary(cfg.summary_path, summary)
     return summary, history_rows
@@ -1187,27 +1208,21 @@ def run_saved_evaluation(cfg: Config, split: str) -> dict[str, float]:
     model = build_model(cfg, device)
     load_model_weights(model, cfg.checkpoint_path, device)
     metrics = evaluate_model(model, loader, cfg, device, cfg.epochs)
+    graphical_dir = save_complex_prediction_graphs(
+        model=model,
+        loader=loader,
+        freq_axis_hz=frequency_axis(cfg, device),
+        gamma_db_fn=gamma_db,
+        output_dir=cfg.prediction_graphical_dir / split,
+        split=split,
+        plot_count=cfg.prediction_plot_count,
+        device=device,
+    )
     metrics["split"] = split
     metrics["checkpoint"] = str(cfg.checkpoint_path)
+    metrics["graphical_dir"] = str(graphical_dir)
+    metrics["prediction_graph_count"] = min(cfg.prediction_plot_count, len(loader.dataset))
     return metrics
-
-
-def plot_loss_curve(history_rows: list[dict[str, float]], output_path: Path) -> None:
-    epochs = [row["epoch"] for row in history_rows]
-    train_loss = [row["train_total"] for row in history_rows]
-    val_loss = [row["val_total"] for row in history_rows]
-    plt.figure()
-    plt.plot(epochs, train_loss, label="Train total loss")
-    plt.plot(epochs, val_loss, label="Validation total loss")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.title("R5 Physics-Informed Training Curve")
-    plt.grid(True)
-    plt.legend()
-    plt.tight_layout()
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    plt.savefig(output_path, dpi=180)
-    plt.close()
 
 
 def parse_args() -> Config:
@@ -1232,6 +1247,7 @@ def parse_args() -> Config:
     parser.add_argument("--curriculum-off", action="store_true")
     parser.add_argument("--seq-len", type=int, default=cfg.seq_len)
     parser.add_argument("--eval-split", choices=["val", "test"])
+    parser.add_argument("--prediction-plot-count", type=int, default=cfg.prediction_plot_count)
     args = parser.parse_args()
 
     cfg.csv_path = args.csv_path
@@ -1248,6 +1264,7 @@ def parse_args() -> Config:
     cfg.log_every_batches = args.log_every_batches
     cfg.seq_len = args.seq_len
     cfg.eval_split = args.eval_split or ""
+    cfg.prediction_plot_count = max(0, args.prediction_plot_count)
     if args.curriculum_off:
         cfg.curriculum_epochs = 0
         cfg.curriculum_stride = 1
@@ -1281,6 +1298,7 @@ def main() -> None:
     summary, history_rows = train_model(cfg)
     plot_loss_curve(history_rows, cfg.loss_plot_path)
     print(f"Loss curve saved to: {cfg.loss_plot_path}")
+    print(f"Prediction graphs saved to: {summary['prediction_graphical_dir']}")
     print("Training summary:")
     for key, value in summary.items():
         print(f"  {key}: {value}")

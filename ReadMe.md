@@ -41,7 +41,7 @@ python3 main.py ...
 `main.py` forwards to:
 
 - `Model/patch_antenna_ai_r5.py` for the non-PINN path
-- `Model/PINN/R5PINN_perF.py` for the PINN path when `--usepinn` is present
+- `Model/Pinn/R5PINN_perF.py` for the PINN path when `--usepinn` is present
 
 ## Data Preparation
 
@@ -208,3 +208,20 @@ Main method families referenced by the codebase:
 ## Current baseline note
 
 `Model/patch_antenna_ai_r5.py` is the current cleaned baseline in this repo snapshot. It trains a graph-based encoder plus FEDformer-style decoder for `61` S11 samples and supports `mag_only` or `complex_61` output formatting depending on the CSV layout.
+
+
+
+
+"""
+Summary of changes for the PINN NaN loss:
+Sanitize curves_db in ProcessedCurveDataset
+After loading the CSV, non-finite values in the dB columns are replaced and then clamped:
+torch.where(torch.isfinite(...), curves_db, -80.0) so nan/-inf become -80 dB
+torch.clamp(..., min=-80, max=0) so all values stay in [-80, 0] and +inf becomes 0
+That way targets and weights are always finite even if the source data had log(0) or bad values.
+Safe resonance_weights_db
+The divisor is now max(sigma_db, 1e-6) so the weight computation never divides by zero.
+Defensive pointwise_physics_loss
+The data term is wrapped in torch.nan_to_num(..., nan=0.0, posinf=0.0, neginf=0.0) so any remaining non-finite value in the loss is replaced and training doesn’t get a NaN loss.
+Re-run PINN training (e.g. cd /home/ubuntu/A && ./run_pinn_then_nopinn_tmux.sh, then tmux attach -t antenna). The data loss and total loss should stay finite. If the CSV was already written with -inf/nan, the in-memory sanitization will fix it; if you prefer a clean file on disk, you can re-run preprocessing after these code changes so the processed CSV itself has no non-finite values.
+"""

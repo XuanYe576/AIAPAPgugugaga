@@ -6,12 +6,17 @@ import argparse
 import csv
 import json
 import math
+import sys
 from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 RESULTS_ROOT = REPO_ROOT / "results"
 DEFAULT_OUTPUT_DIR = REPO_ROOT / "metrics" / "figures"
+
+from metrics.plotting import load_pyplot
 
 
 def parse_args() -> argparse.Namespace:
@@ -73,20 +78,6 @@ def load_summary(path: Path) -> dict[str, float | str]:
     with path.open(encoding="utf-8") as handle:
         payload = json.load(handle)
     return payload
-
-
-def load_pyplot():
-    try:
-        import matplotlib
-
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except ModuleNotFoundError as exc:
-        raise SystemExit(
-            "matplotlib is required to create visualizations. "
-            "Install it with: pip install matplotlib"
-        ) from exc
-    return plt
 
 
 def grouped_metric_columns(rows: list[dict[str, float]], prefix: str) -> list[str]:

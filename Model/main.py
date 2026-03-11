@@ -6,7 +6,7 @@ Usage:
 
 The script forwards the remaining arguments to the selected backend:
 - `Model/patch_antenna_ai_r5.py` for the non-PINN path
-- `Model/PINN/R5PINN_perF.py` for the PINN path
+- `Model/Pinn/R5PINN_perF.py` for the PINN path
 """
 
 from __future__ import annotations
@@ -17,9 +17,9 @@ import sys
 from pathlib import Path
 
 
-REPO_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = Path(__file__).resolve().parents[1]
 R5_SCRIPT = REPO_ROOT / "Model" / "patch_antenna_ai_r5.py"
-PINN_SCRIPT = REPO_ROOT / "Model" / "PINN" / "R5PINN_perF.py"
+PINN_SCRIPT = REPO_ROOT / "Model" / "Pinn" / "R5PINN_perF.py"
 PINN_COMMANDS = {"preprocess", "inspect", "train"}
 
 
