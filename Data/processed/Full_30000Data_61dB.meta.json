@@ -3,7 +3,9 @@
   "curves_root": "/Users/zhuowenfeng6626/Downloads/ProjectAntennaPatch/mainPAP/Data/NotprocessedData",
   "processed_csv_path": "/Users/zhuowenfeng6626/Downloads/ProjectAntennaPatch/mainPAP/Data/processed/Full_30000Data_61dB.csv",
   "num_geometries": 30000,
-  "num_curve_files": 60000,
+  "num_curve_files": 30000,
+  "num_curve_files_discovered": 60000,
+  "num_curve_paths_scanned": 60006,
   "num_duplicate_curve_ids": 6,
   "duplicate_curve_ids": [
     2000,
