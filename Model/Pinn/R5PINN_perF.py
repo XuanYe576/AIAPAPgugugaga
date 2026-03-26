@@ -23,7 +23,6 @@ import csv
 import json
 import math
 import random
-import re
 import sys
 from collections import defaultdict
 from dataclasses import asdict, dataclass, field
@@ -70,13 +69,28 @@ if str(REPO_ROOT) not in sys.path:
 GRID_HEIGHT = 10
 GRID_WIDTH = 10
 NUM_CELLS = GRID_HEIGHT * GRID_WIDTH
-RAW_DATA_ROOT = REPO_ROOT / "Data" / "Patch Antennas 6,001-30,000-selected"
+
+
+def _default_raw_data_root() -> Path:
+    candidates = [
+        REPO_ROOT / "Data" / "NotprocessedData",
+        REPO_ROOT / "Data" / "Patch Antennas 6,001-30,000-selected",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path
+    return candidates[0]
+
+
+RAW_DATA_ROOT = _default_raw_data_root()
 
 from metrics.prediction_graphs import save_scalar_prediction_graphs
+from utils.dataP import preprocess_uploaded_dataset as build_processed_dataset
 
 
 def _default_geometry_catalog_path() -> Path:
     candidates = [
+        RAW_DATA_ROOT / "60000 Patch Antenna File" / "patch_antennas_updated5b.csv",
         RAW_DATA_ROOT / "30000 Patch Antenna File" / "patch_antennas_updated4.csv",
         RAW_DATA_ROOT / "19001-20000" / "patch_antennas_updated3.csv",
         RAW_DATA_ROOT / "15000 Patch Antenna File" / "patch_antennas_updated2.csv",
@@ -93,11 +107,11 @@ def _default_processed_dir() -> Path:
 
 
 def _default_processed_csv() -> Path:
-    return _default_processed_dir() / "Full_30000Data_61dB.csv"
+    return _default_processed_dir() / "Full_60000Data_61dB.csv"
 
 
 def _default_processed_meta() -> Path:
-    return _default_processed_dir() / "Full_30000Data_61dB.meta.json"
+    return _default_processed_dir() / "Full_60000Data_61dB.meta.json"
 
 
 def _default_results_dir() -> Path:
@@ -280,139 +294,17 @@ def load_model_weights(model: nn.Module, checkpoint_path: Path, device: str) -> 
     return {}
 
 
-def parse_geometry_catalog(path: Path) -> tuple[dict[int, np.ndarray], dict[str, int]]:
-    geometries: dict[int, np.ndarray] = {}
-    with path.open(newline="", encoding="utf-8") as handle:
-        reader = csv.reader(handle)
-        header_rows = [next(reader) for _ in range(3)]
-        meta = {
-            "num_antennas": int(header_rows[0][1]),
-            "grid_width": int(header_rows[1][1]),
-            "grid_height": int(header_rows[2][1]),
-        }
-        while True:
-            try:
-                marker = next(reader)
-            except StopIteration:
-                break
-            if not marker:
-                continue
-            match = re.search(r"Patch Antenna(\d+)", marker[0])
-            if not match:
-                continue
-            antenna_id = int(match.group(1))
-            grid_rows: list[list[float]] = []
-            for _ in range(GRID_HEIGHT):
-                grid_row = next(reader)
-                if len(grid_row) != GRID_WIDTH:
-                    raise ValueError(
-                        f"Unexpected geometry row width in {path}: "
-                        f"antenna {antenna_id} has {len(grid_row)} columns."
-                    )
-                grid_rows.append([float(value) for value in grid_row])
-            geometries[antenna_id] = np.asarray(grid_rows, dtype=np.float32).reshape(-1)
-    return geometries, meta
-
-
-def collect_curve_paths(root: Path) -> tuple[dict[int, Path], dict[int, list[Path]]]:
-    selected: dict[int, Path] = {}
-    duplicates: dict[int, list[Path]] = defaultdict(list)
-    for path in sorted(root.rglob("patch_*_s11_plot.csv")):
-        match = re.search(r"patch_(\d+)_s11_plot\.csv$", path.name)
-        if not match:
-            continue
-        antenna_id = int(match.group(1))
-        if antenna_id in selected:
-            duplicates[antenna_id].append(path)
-            continue
-        selected[antenna_id] = path
-    return selected, duplicates
-
-
-def load_curve_csv(path: Path) -> tuple[np.ndarray, np.ndarray]:
-    freq_ghz: list[float] = []
-    s11_db: list[float] = []
-    with path.open(newline="", encoding="utf-8") as handle:
-        reader = csv.reader(handle)
-        header = next(reader, None)
-        if not header or len(header) < 2:
-            raise ValueError(f"Curve file is missing a 2-column header: {path}")
-        for row in reader:
-            if len(row) < 2:
-                continue
-            freq_ghz.append(float(row[0]))
-            s11_db.append(float(row[1]))
-    if not freq_ghz:
-        raise ValueError(f"Curve file has no samples: {path}")
-    return np.asarray(freq_ghz, dtype=np.float32), np.asarray(s11_db, dtype=np.float32)
-
-
 def preprocess_uploaded_dataset(cfg: Config) -> dict[str, object]:
-    cfg.processed_csv_path.parent.mkdir(parents=True, exist_ok=True)
-    if (
-        cfg.processed_csv_path.exists()
-        and cfg.processed_meta_path.exists()
-        and not cfg.overwrite_processed
-    ):
-        with cfg.processed_meta_path.open(encoding="utf-8") as handle:
-            return json.load(handle)
-
-    geometries, geom_meta = parse_geometry_catalog(cfg.geometry_catalog_path)
-    curve_paths, duplicates = collect_curve_paths(cfg.curves_root)
-    missing_curve_ids = sorted(set(geometries) - set(curve_paths))
-
-    matched_ids = sorted(set(geometries) & set(curve_paths))
-    if cfg.max_antennas > 0:
-        matched_ids = matched_ids[: cfg.max_antennas]
-    if not matched_ids:
-        raise RuntimeError("No matching antenna ids were found between geometry and S11 files.")
-
-    freq_reference: np.ndarray | None = None
-    skipped_ids: list[int] = []
-    valid_ids: list[int] = []
-    valid_rows = 0
-
-    with cfg.processed_csv_path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.writer(handle)
-        for antenna_id in matched_ids:
-            freq_ghz, s11_db = load_curve_csv(curve_paths[antenna_id])
-            if freq_reference is None:
-                freq_reference = freq_ghz
-            elif len(freq_ghz) != len(freq_reference) or not np.allclose(
-                freq_ghz, freq_reference, atol=1e-6
-            ):
-                skipped_ids.append(antenna_id)
-                continue
-
-            geom_bits = geometries[antenna_id].astype(np.int32).tolist()
-            row = geom_bits + [float(value) for value in s11_db.tolist()]
-            writer.writerow(row)
-            valid_rows += 1
-            valid_ids.append(antenna_id)
-
-    if freq_reference is None:
-        raise RuntimeError("Failed to build a reference frequency axis from the S11 files.")
-
-    summary = {
-        "geometry_catalog_path": str(cfg.geometry_catalog_path),
-        "curves_root": str(cfg.curves_root),
-        "processed_csv_path": str(cfg.processed_csv_path),
-        "num_geometries": len(geometries),
-        "num_curve_files": len(curve_paths),
-        "num_duplicate_curve_ids": len(duplicates),
-        "duplicate_curve_ids": sorted(duplicates),
-        "missing_curve_ids": missing_curve_ids,
-        "matched_antennas": valid_rows,
-        "skipped_antennas": skipped_ids,
-        "seq_len": int(len(freq_reference)),
-        "freq_axis_ghz": [float(value) for value in freq_reference.tolist()],
-        "grid_width": geom_meta["grid_width"],
-        "grid_height": geom_meta["grid_height"],
-        "matched_antenna_ids": valid_ids,
-    }
-    with cfg.processed_meta_path.open("w", encoding="utf-8") as handle:
-        json.dump(summary, handle, indent=2)
-    return summary
+    return build_processed_dataset(
+        geometry_catalog_path=cfg.geometry_catalog_path,
+        curves_root=cfg.curves_root,
+        processed_csv_path=cfg.processed_csv_path,
+        processed_meta_path=cfg.processed_meta_path,
+        overwrite_processed=cfg.overwrite_processed,
+        max_antennas=cfg.max_antennas,
+        grid_height=GRID_HEIGHT,
+        grid_width=GRID_WIDTH,
+    )
 
 
 class ProcessedCurveDataset:

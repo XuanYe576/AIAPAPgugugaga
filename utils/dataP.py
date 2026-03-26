@@ -30,6 +30,7 @@ RAW_DATA_ROOT = _default_raw_data_root()
 
 def _default_geometry_catalog_path() -> Path:
     candidates = [
+        RAW_DATA_ROOT / "60000 Patch Antenna File" / "patch_antennas_updated5b.csv",
         RAW_DATA_ROOT / "30000 Patch Antenna File" / "patch_antennas_updated4.csv",
         RAW_DATA_ROOT / "19001-20000" / "patch_antennas_updated3.csv",
         RAW_DATA_ROOT / "15000 Patch Antenna File" / "patch_antennas_updated2.csv",
@@ -42,11 +43,11 @@ def _default_geometry_catalog_path() -> Path:
 
 
 def _default_processed_csv() -> Path:
-    return REPO_ROOT / "Data" / "processed" / "Full_30000Data_61dB.csv"
+    return REPO_ROOT / "Data" / "processed" / "Full_60000Data_61dB.csv"
 
 
 def _default_processed_meta() -> Path:
-    return REPO_ROOT / "Data" / "processed" / "Full_30000Data_61dB.meta.json"
+    return REPO_ROOT / "Data" / "processed" / "Full_60000Data_61dB.meta.json"
 
 
 def parse_geometry_catalog(
