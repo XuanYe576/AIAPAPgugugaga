@@ -1,18 +1,5 @@
-"""R5 PINN per-frequency training entry.
-
-This file separates the PINN-oriented workflow from the sequence R5 surrogate
-in `Model/patch_antenna_ai_r5.py`.
-
-It is tailored to the uploaded raw dataset layout:
-- geometry catalog CSV:
-  `Patch AntennaN` marker + 10 rows of 10 binary cells
-- one S11 CSV per antenna:
-  `patch_<id>_s11_plot.csv` with 61 dB(S11) samples from 1 to 6 GHz
-
-The script can:
-1. preprocess the uploaded raw files into an old-style matrix dataset
-   `[100 geometry bits + 61 dB values]`
-2. train a per-frequency physics-informed model
+"""
+1. train a per-frequency physics-informed model
    `geometry + frequency -> dB(S11)`
 """
 
@@ -145,6 +132,7 @@ class Config:
     graph_k: int = 8
     dropout: float = 0.10
     loss_passive: float = 0.10
+    resonance_loss_weight: float = 0.10
     notch_sigma_db: float = 4.0
     patience: int = 12
     gradient_clip: float = 1.0
@@ -265,13 +253,13 @@ def save_checkpoint(
     model: nn.Module,
     optimizer: object,
     epoch: int,
-    best_val: float,
+    best_selection_total: float,
 ) -> None:
     require_torch("checkpoint save")
     torch.save(
         {
             "epoch": epoch,
-            "best_val_total": best_val,
+            "best_selection_total": best_selection_total,
             "model_state_dict": model.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
             "config": {
@@ -357,6 +345,67 @@ def resonance_weights_db(curves_db: torch.Tensor, sigma_db: float) -> torch.Tens
     return 1.0 + 2.0 * torch.exp(-((curves_db - minima) / sigma_db) ** 2)
 
 
+def extract_patch_length(bits: torch.Tensor) -> torch.Tensor:
+    cell_size_m = 15.0e-3
+    grid = bits.view(-1, GRID_HEIGHT, GRID_WIDTH)
+    metal_mask = grid > 0.5
+
+    row_presence = metal_mask.any(dim=2)
+    col_presence = metal_mask.any(dim=1)
+    row_indices = torch.arange(GRID_HEIGHT, device=grid.device).view(1, GRID_HEIGHT)
+    col_indices = torch.arange(GRID_WIDTH, device=grid.device).view(1, GRID_WIDTH)
+
+    r_min = torch.where(
+        row_presence,
+        row_indices,
+        torch.full_like(row_indices, GRID_HEIGHT),
+    ).min(dim=1).values
+    r_max = torch.where(row_presence, row_indices, torch.zeros_like(row_indices)).max(dim=1).values
+    c_min = torch.where(
+        col_presence,
+        col_indices,
+        torch.full_like(col_indices, GRID_WIDTH),
+    ).min(dim=1).values
+    c_max = torch.where(col_presence, col_indices, torch.zeros_like(col_indices)).max(dim=1).values
+
+    has_metal = metal_mask.flatten(1).any(dim=1)
+    lx_cells = c_max - c_min + 1
+    ly_cells = r_max - r_min + 1
+    resonant_cells = torch.maximum(lx_cells, ly_cells)
+    resonant_cells = torch.where(has_metal, resonant_cells, torch.ones_like(resonant_cells))
+    return resonant_cells.to(dtype=torch.float32) * cell_size_m
+
+
+def theoretical_resonant_freq(L_m: torch.Tensor) -> torch.Tensor:
+    c_m_per_s = 3.0e8
+    h_m = 1.57e-3
+    er = 4.4
+    L_m = L_m.to(dtype=torch.float32).clamp_min(1.0e-6)
+    u = 1.0 + 12.0 * h_m / L_m
+    ee = (er + 1.0) / 2.0 + (er - 1.0) / (2.0 * torch.sqrt(u))
+    return c_m_per_s / (2.0 * L_m * torch.sqrt(ee)) / 1.0e9
+
+
+def resonance_frequency_loss(
+    geom_bits: torch.Tensor,
+    pred_curves_db: torch.Tensor,
+    freq_axis_ghz: torch.Tensor,
+) -> torch.Tensor:
+    curve_mask = torch.isfinite(pred_curves_db).all(dim=1)
+    if not curve_mask.any():
+        return pred_curves_db.new_zeros(())
+
+    pred_curves_db = pred_curves_db[curve_mask]
+    geom_bits = geom_bits[curve_mask]
+    pred_notch_idx = pred_curves_db.argmin(dim=1)
+    pred_notch_ghz = freq_axis_ghz[pred_notch_idx]
+    theory_notch_ghz = theoretical_resonant_freq(extract_patch_length(geom_bits))
+    finite = torch.isfinite(pred_notch_ghz) & torch.isfinite(theory_notch_ghz)
+    if not finite.any():
+        return pred_curves_db.new_zeros(())
+    return (pred_notch_ghz[finite] - theory_notch_ghz[finite]).pow(2).mean()
+
+
 class PerFrequencyDataset(Dataset):
     def __init__(self, base: ProcessedCurveDataset, antenna_indices: list[int]) -> None:
         self.base = base
@@ -369,14 +418,14 @@ class PerFrequencyDataset(Dataset):
     def __getitem__(
         self,
         idx: int,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]:
         antenna_slot, freq_idx = divmod(idx, self.seq_len)
         antenna_idx = self.antenna_indices[antenna_slot]
         geom_bits = self.base.geometry[antenna_idx]
         freq_norm = self.base.freq_axis_norm[freq_idx].view(1)
         target_db = self.base.curves_db[antenna_idx, freq_idx]
         weight = self.base.sample_weights[antenna_idx, freq_idx]
-        return geom_bits, freq_norm, target_db, weight, freq_idx
+        return geom_bits, freq_norm, target_db, weight, freq_idx, antenna_slot
 
 
 def build_geometry_graph(
@@ -609,7 +658,8 @@ def pointwise_physics_terms(
     cfg: Config,
 ) -> PointLossBreakdown:
     data = weights * F.smooth_l1_loss(pred_db, target_db, reduction="none")
-    passive = torch.relu(pred_db).pow(2)
+    s11_lin = torch.pow(pred_db.new_tensor(10.0), pred_db / 20.0)
+    passive = F.relu(s11_lin - 1.0).pow(2)
     total = data + cfg.loss_passive * passive
     return PointLossBreakdown(total=total, data=data, passive=passive)
 
@@ -734,8 +784,20 @@ def evaluate_model(
     model.eval()
     totals = {"total": 0.0, "data": 0.0, "passive": 0.0, "mae": 0.0}
     count = 0
+    dataset = loader.dataset
+    pred_curves = None
+    geom_subset = None
+    freq_axis_ghz = None
+    if isinstance(dataset, PerFrequencyDataset):
+        pred_curves = torch.full(
+            (len(dataset.antenna_indices), dataset.seq_len),
+            float("nan"),
+            dtype=torch.float32,
+        )
+        geom_subset = dataset.base.geometry[dataset.antenna_indices].detach().cpu()
+        freq_axis_ghz = dataset.base.freq_axis_ghz.detach().cpu()
     with torch.no_grad():
-        for geom_bits, freq_norm, target_db, weights, _freq_idx in loader:
+        for geom_bits, freq_norm, target_db, weights, freq_idx, antenna_slot in loader:
             geom_bits = geom_bits.to(device)
             freq_norm = freq_norm.to(device)
             target_db = target_db.to(device)
@@ -748,7 +810,24 @@ def evaluate_model(
             totals["passive"] += losses.passive.item() * batch_size
             totals["mae"] += torch.abs(pred_db - target_db).mean().item() * batch_size
             count += batch_size
-    return {key: value / max(1, count) for key, value in totals.items()}
+
+            if pred_curves is not None:
+                pred_curves[
+                    antenna_slot.to(dtype=torch.long),
+                    freq_idx.to(dtype=torch.long),
+                ] = pred_db.detach().cpu()
+
+    metrics = {key: value / max(1, count) for key, value in totals.items()}
+    if pred_curves is not None and geom_subset is not None and freq_axis_ghz is not None:
+        metrics["resonance_loss"] = float(
+            resonance_frequency_loss(geom_subset, pred_curves, freq_axis_ghz).item()
+        )
+    else:
+        metrics["resonance_loss"] = 0.0
+    metrics["selection_total"] = (
+        metrics["total"] + cfg.resonance_loss_weight * metrics["resonance_loss"]
+    )
+    return metrics
 
 
 def train_model(cfg: Config) -> dict[str, float]:
@@ -775,7 +854,9 @@ def train_model(cfg: Config) -> dict[str, float]:
     scaler = torch.cuda.amp.GradScaler(enabled=(device == "cuda" and cfg.use_amp))
 
     history_rows: list[dict[str, float]] = []
-    best_val = float("inf")
+    best_selection_total = float("inf")
+    best_val_total = float("inf")
+    best_val_resonance = float("inf")
     best_epoch = 0
     patience_left = cfg.patience
 
@@ -791,6 +872,8 @@ def train_model(cfg: Config) -> dict[str, float]:
                 "val_data",
                 "val_passive",
                 "val_mae",
+                "val_resonance_loss",
+                "val_selection_total",
             ]
         )
     with cfg.loss_per_freq_path.open("w", newline="", encoding="utf-8") as handle:
@@ -813,7 +896,7 @@ def train_model(cfg: Config) -> dict[str, float]:
         count = 0
         amp_enabled = device == "cuda" and cfg.use_amp
 
-        for batch_idx, (geom_bits, freq_norm, target_db, weights, freq_idx) in enumerate(
+        for batch_idx, (geom_bits, freq_norm, target_db, weights, freq_idx, _antenna_slot) in enumerate(
             train_loader,
             start=1,
         ):
@@ -883,6 +966,8 @@ def train_model(cfg: Config) -> dict[str, float]:
             "val_data": val_metrics["data"],
             "val_passive": val_metrics["passive"],
             "val_mae": val_metrics["mae"],
+            "val_resonance_loss": val_metrics["resonance_loss"],
+            "val_selection_total": val_metrics["selection_total"],
         }
         history_rows.append(row)
 
@@ -898,6 +983,8 @@ def train_model(cfg: Config) -> dict[str, float]:
                     row["val_data"],
                     row["val_passive"],
                     row["val_mae"],
+                    row["val_resonance_loss"],
+                    row["val_selection_total"],
                 ]
             )
         with cfg.loss_per_freq_path.open("a", newline="", encoding="utf-8") as handle:
@@ -909,13 +996,17 @@ def train_model(cfg: Config) -> dict[str, float]:
             f"{epoch:03d} | "
             f"train {row['train_total']:.6f} | "
             f"val {row['val_total']:.6f} | "
+            f"res {row['val_resonance_loss']:.6f} | "
+            f"select {row['val_selection_total']:.6f} | "
             f"mae {row['val_mae']:.6f}"
         )
 
-        if row["val_total"] < best_val - 1e-6:
-            best_val = row["val_total"]
+        if row["val_selection_total"] < best_selection_total - 1e-6:
+            best_selection_total = row["val_selection_total"]
+            best_val_total = row["val_total"]
+            best_val_resonance = row["val_resonance_loss"]
             best_epoch = epoch
-            save_checkpoint(cfg, model, optimizer, epoch, best_val)
+            save_checkpoint(cfg, model, optimizer, epoch, best_selection_total)
             patience_left = cfg.patience
             print(f"  saved checkpoint: {cfg.checkpoint_path}")
         else:
@@ -939,11 +1030,16 @@ def train_model(cfg: Config) -> dict[str, float]:
     )
     summary = {
         "best_epoch": best_epoch,
-        "best_val_total": best_val,
+        "best_val_total": best_val_total,
+        "best_val_resonance_loss": best_val_resonance,
+        "best_val_selection_total": best_selection_total,
         "test_total": test_metrics["total"],
         "test_data": test_metrics["data"],
         "test_passive": test_metrics["passive"],
         "test_mae": test_metrics["mae"],
+        "test_resonance_loss": test_metrics["resonance_loss"],
+        "test_selection_total": test_metrics["selection_total"],
+        "resonance_loss_weight": cfg.resonance_loss_weight,
         "num_antennas": len(base),
         "seq_len": base.seq_len,
         "prediction_graphical_dir": str(graphical_dir),
@@ -1034,6 +1130,7 @@ def parse_args() -> Config:
     parser.add_argument("--log-every-batches", type=int, default=cfg.log_every_batches)
     parser.add_argument("--eval-split", choices=["val", "test"])
     parser.add_argument("--prediction-plot-count", type=int, default=cfg.prediction_plot_count)
+    parser.add_argument("--resonance-loss-weight", type=float, default=cfg.resonance_loss_weight)
     parser.add_argument("--overwrite-processed", action="store_true")
     args = parser.parse_args()
 
@@ -1053,6 +1150,7 @@ def parse_args() -> Config:
     cfg.log_every_batches = args.log_every_batches
     cfg.eval_split = args.eval_split or ""
     cfg.prediction_plot_count = max(0, args.prediction_plot_count)
+    cfg.resonance_loss_weight = max(0.0, args.resonance_loss_weight)
     cfg.overwrite_processed = args.overwrite_processed
     return cfg
 

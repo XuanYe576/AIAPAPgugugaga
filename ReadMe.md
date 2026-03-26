@@ -1,16 +1,24 @@
 # AI-Assisted Patch Antenna Design Using a Hybrid Encoder-Decoder Architecture
 
-This project explores data-driven patch antenna design with hybrid encoder-decoder models that predict S11 responses from `10 x 10` binary patch geometries.
+Assuming you mean the physics-informed PINN path, the actual backend is [`mainPAP/Model/Pinn/R5PINN_perF.py`](/Users/zhuowenfeng6626/Downloads/ProjectAntennaPatch/mainPAP/Model/Pinn/R5PINN_perF.py#L1), selected by [`mainPAP/Model/main.py`](/Users/zhuowenfeng6626/Downloads/ProjectAntennaPatch/mainPAP/Model/main.py#L34). The flow is:
 
-The main runnable entry point in the current repository snapshot is `main.py`. Older notebooks, archived experiments, and supporting notes are kept under `old/`.
+- Preprocess raw geometry catalogs plus per-antenna S11 CSVs into one matrix of `[100 geometry bits + 61 dB points]` in [`mainPAP/Model/Pinn/R5PINN_perF.py`](/Users/zhuowenfeng6626/Downloads/ProjectAntennaPatch/mainPAP/Model/Pinn/R5PINN_perF.py#L350).
+- Expand each antenna into 61 point samples, so training becomes `(geometry, normalized frequency) -> dB(S11)` in [`mainPAP/Model/Pinn/R5PINN_perF.py`](/Users/zhuowenfeng6626/Downloads/ProjectAntennaPatch/mainPAP/Model/Pinn/R5PINN_perF.py#L418) and [`mainPAP/Model/Pinn/R5PINN_perF.py`](/Users/zhuowenfeng6626/Downloads/ProjectAntennaPatch/mainPAP/Model/Pinn/R5PINN_perF.py#L468).
+- Encode the 10x10 patch as a graph with node occupancy plus coordinate features, then fuse that geometry embedding with sinusoidal/polynomial frequency features before predicting one scalar dB value in [`mainPAP/Model/Pinn/R5PINN_perF.py`](/Users/zhuowenfeng6626/Downloads/ProjectAntennaPatch/mainPAP/Model/Pinn/R5PINN_perF.py#L490), [`mainPAP/Model/Pinn/R5PINN_perF.py`](/Users/zhuowenfeng6626/Downloads/ProjectAntennaPatch/mainPAP/Model/Pinn/R5PINN_perF.py#L621), and [`mainPAP/Model/Pinn/R5PINN_perF.py`](/Users/zhuowenfeng6626/Downloads/ProjectAntennaPatch/mainPAP/Model/Pinn/R5PINN_perF.py#L690).
+
+The “physics-informed” part is mostly in the loss, not in the forward model:
+
+- Resonance weighting upweights samples near the deepest S11 notch: [`mainPAP/Model/Pinn/R5PINN_perF.py`](/Users/zhuowenfeng6626/Downloads/ProjectAntennaPatch/mainPAP/Model/Pinn/R5PINN_perF.py#L463).
+- Passivity penalty punishes predicted positive dB values with `relu(pred_db)^2`, which encodes that passive antennas should have S11 in dB at or below 0: [`mainPAP/Model/Pinn/R5PINN_perF.py`](/Users/zhuowenfeng6626/Downloads/ProjectAntennaPatch/mainPAP/Model/Pinn/R5PINN_perF.py#L713).
+- Total loss is weighted SmoothL1 data fit plus the passivity term: [`mainPAP/Model/Pinn/R5PINN_perF.py`](/Users/zhuowenfeng6626/Downloads/ProjectAntennaPatch/mainPAP/Model/Pinn/R5PINN_perF.py#L725), used in training here: [`mainPAP/Model/Pinn/R5PINN_perF.py`](/Users/zhuowenfeng6626/Downloads/ProjectAntennaPatch/mainPAP/Model/Pinn/R5PINN_perF.py#L916).
+
+Important nuance: this is not a classical PINN with Maxwell/PDE residuals or boundary-condition losses. There is no autograd-based physics residual in this file. It is better described as a physics-informed surrogate with soft physical constraints.
 
 ## Repository layout
 
-- `Model/`: current training code and model implementations.
-- `Data/`: intended location for active datasets such as `Full_1000Data.csv`.
-- `patch_antennas_updated.csv`: currently available CSV in this snapshot.
+- `Model/`: My edits
+- `Data/`: processed data to run and train.
 - `results/`: training outputs and saved analysis artifacts.
-- `old/`: archived notebooks, experiment notes, and previous documentation.
 - `introduction_and_pdfs/`: specifications, presentation material, reference notes, and images.
 - `utils/`: utility scripts.
 
@@ -52,10 +60,9 @@ cd mainPAP
 python3 main.py --usepinn preprocess --overwrite-processed
 ```
 
-This builds:
+-->
 
-- `Data/processed/Full_30000Data_61dB.csv`
-- `Data/processed/Full_30000Data_61dB.meta.json`
+- `Data/processed/Full_data_61dB.csv`
 
 ## Common Commands
 

@@ -2,7 +2,7 @@
 
 Usage:
   python3 main.py [non-PINN args...]
-  python3 main.py --usepinn [preprocess|inspect|train] [PINN args...]
+  python3 main.py --usepinn [train] [PINN args...]
 
 The script forwards the remaining arguments to the selected backend:
 - `Model/patch_antenna_ai_r5.py` for the non-PINN path
@@ -20,7 +20,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 R5_SCRIPT = REPO_ROOT / "Model" / "patch_antenna_ai_r5.py"
 PINN_SCRIPT = REPO_ROOT / "Model" / "Pinn" / "R5PINN_perF.py"
-PINN_COMMANDS = {"preprocess", "inspect", "train"}
+PINN_COMMANDS = {"train"}
 
 
 def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:

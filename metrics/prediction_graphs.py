@@ -99,6 +99,53 @@ def save_complex_prediction_graphs(
     return output_dir
 
 
+def save_real_channel_prediction_graphs(
+    model,
+    loader,
+    freq_axis_hz,
+    output_dir: Path,
+    split: str,
+    plot_count: int,
+    device: str,
+    channel_idx: int = 0,
+    ylabel: str = "S11 (dB)",
+) -> Path:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if plot_count <= 0:
+        return output_dir
+
+    import torch
+
+    plt = load_pyplot()
+    x_values = (freq_axis_hz.detach().cpu().numpy() / 1.0e9).tolist()
+    saved = 0
+    model.eval()
+
+    with torch.no_grad():
+        for xb, yb in loader:
+            xb = xb.to(device)
+            yb = yb.to(device)
+            outputs = model(xb, freq_axis_hz)
+            pred_values = outputs["gamma"][..., channel_idx].detach().cpu().numpy()
+            target_values = yb[..., channel_idx].detach().cpu().numpy()
+
+            for sample_idx in range(pred_values.shape[0]):
+                if saved >= plot_count:
+                    return output_dir
+                _plot_prediction_pair(
+                    plt=plt,
+                    x_values=x_values,
+                    target_values=target_values[sample_idx],
+                    pred_values=pred_values[sample_idx],
+                    output_path=output_dir / f"{split}_sample_{saved + 1:04d}.png",
+                    title=f"{split.upper()} Prediction {saved + 1:04d}",
+                    ylabel=ylabel,
+                )
+                saved += 1
+
+    return output_dir
+
+
 def save_scalar_prediction_graphs(
     model,
     base,
