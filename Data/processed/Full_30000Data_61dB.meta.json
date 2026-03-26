@@ -1,9 +1,9 @@
 {
-  "geometry_catalog_path": "/Users/zhuowenfeng6626/Downloads/ProjectAntennaPatch/mainPAP/Data/Patch Antennas 6,001-30,000-selected/30000 Patch Antenna File/patch_antennas_updated4.csv",
-  "curves_root": "/Users/zhuowenfeng6626/Downloads/ProjectAntennaPatch/mainPAP/Data/Patch Antennas 6,001-30,000-selected",
+  "geometry_catalog_path": "/Users/zhuowenfeng6626/Downloads/ProjectAntennaPatch/mainPAP/Data/NotprocessedData/30000 Patch Antenna File/patch_antennas_updated4.csv",
+  "curves_root": "/Users/zhuowenfeng6626/Downloads/ProjectAntennaPatch/mainPAP/Data/NotprocessedData",
   "processed_csv_path": "/Users/zhuowenfeng6626/Downloads/ProjectAntennaPatch/mainPAP/Data/processed/Full_30000Data_61dB.csv",
   "num_geometries": 30000,
-  "num_curve_files": 29999,
+  "num_curve_files": 60000,
   "num_duplicate_curve_ids": 6,
   "duplicate_curve_ids": [
     2000,
@@ -13,10 +13,8 @@
     4200,
     5000
   ],
-  "missing_curve_ids": [
-    20000
-  ],
-  "matched_antennas": 29999,
+  "missing_curve_ids": [],
+  "matched_antennas": 30000,
   "skipped_antennas": [],
   "seq_len": 61,
   "freq_axis_ghz": [
@@ -20084,6 +20082,7 @@
     19997,
     19998,
     19999,
+    20000,
     20001,
     20002,
     20003,
