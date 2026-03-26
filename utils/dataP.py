@@ -84,7 +84,10 @@ def parse_geometry_catalog(
                         f"antenna {antenna_id} has {len(grid_row)} columns."
                     )
                 grid_rows.append([float(value) for value in grid_row])
-            geometries[antenna_id] = np.asarray(grid_rows, dtype=np.float32).reshape(-1)
+            # Match the historical Ori_30k.csv convention:
+            # flatten each 10x10 patch from bottom-to-top, left-to-right.
+            grid = np.asarray(grid_rows, dtype=np.float32)
+            geometries[antenna_id] = np.flipud(grid).reshape(-1)
     return geometries, meta
 
 
