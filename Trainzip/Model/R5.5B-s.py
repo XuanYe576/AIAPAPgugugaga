@@ -41,6 +41,7 @@ from metrics.prediction_graphs import (
     save_real_channel_prediction_graphs,
 )
 from utils.adamw import create_optimizer as create_shared_optimizer
+from utils.amp import autocast_context, build_grad_scaler
 
 GRID_HEIGHT = 10
 GRID_WIDTH = 10
@@ -102,6 +103,8 @@ class Config:
     device: str = "auto"
     random_seed: int = 42
     patience: int = 10
+    gradient_clip: float = 1.0
+    use_amp: bool = True
     use_augmentation: bool = True
     aug_noise_std: float = 0.01
     aug_freq_mask_prob: float = 0.50
@@ -654,6 +657,7 @@ def train_model(cfg: Config) -> tuple[dict[str, float], list[dict[str, float]]]:
     train_loader, val_loader, test_loader = build_dataloaders(dataset, cfg, device)
     model = build_model(cfg, device)
     optimizer = create_optimizer(cfg, model.parameters())
+    scaler = build_grad_scaler(device, cfg.use_amp)
     freq_axis_hz = frequency_axis(cfg, device)
 
     history_rows: list[dict[str, float]] = []
@@ -686,10 +690,14 @@ def train_model(cfg: Config) -> tuple[dict[str, float], list[dict[str, float]]]:
                 xb, yb = augment_batch(xb, yb, cfg)
 
             optimizer.zero_grad(set_to_none=True)
-            outputs = model(xb, freq_axis_hz)
-            loss = complex_mse(outputs["gamma"], yb)
-            loss.backward()
-            optimizer.step()
+            with autocast_context(device, cfg.use_amp):
+                outputs = model(xb, freq_axis_hz)
+                loss = complex_mse(outputs["gamma"], yb)
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.gradient_clip)
+            scaler.step(optimizer)
+            scaler.update()
 
             batch_size = xb.size(0)
             train_total += loss.item() * batch_size

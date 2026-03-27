@@ -1,3 +1,0 @@
-Loss function:
-
-Per point, per dB, 

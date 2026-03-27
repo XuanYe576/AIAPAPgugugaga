@@ -40,11 +40,13 @@ def cuda_amp_enabled(device: str, use_amp: bool) -> bool:
 
 def build_grad_scaler(device: str, use_amp: bool):
     if cuda_amp_enabled(device, use_amp):
-        return torch.cuda.amp.GradScaler(enabled=True)
+        # GH200-class CUDA targets are best served by bfloat16 autocast,
+        # which does not need gradient scaling.
+        return NullGradScaler()
     return NullGradScaler()
 
 
 def autocast_context(device: str, use_amp: bool):
     if cuda_amp_enabled(device, use_amp):
-        return torch.cuda.amp.autocast(enabled=True)
+        return torch.amp.autocast("cuda", dtype=torch.bfloat16)
     return nullcontext()

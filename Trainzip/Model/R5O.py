@@ -77,7 +77,7 @@ class Config:
     seq_len: int = 122
     output_mode: str = "complex_122"
     batch_size: int = 32
-    lr: float = 2e-3
+    lr: float = 5e-4
     optimizer_name: str = "adamw"
     weight_decay: float = 1e-4
     min_lr_scale: float = 0.05
@@ -301,12 +301,12 @@ def build_geometry_graph(
 ) -> GraphStructure:
     rows, cols = np.meshgrid(np.arange(height), np.arange(width), indexing="ij")
     coords = np.stack([rows.reshape(-1), cols.reshape(-1)], axis=1).astype(np.float32)
-    x01 = coords[:, 1:2] / max(1, width - 1)
-    y01 = coords[:, 0:1] / max(1, height - 1)
+    x01 = coords[:, 1] / max(1, width - 1)
+    y01 = coords[:, 0] / max(1, height - 1)
     x_center = 2.0 * x01 - 1.0
     y_center = 2.0 * y01 - 1.0
     radius = np.sqrt(x_center**2 + y_center**2)
-    node_static = np.concatenate([x01, y01, x_center, y_center, radius], axis=1)
+    node_static = np.stack([x01, y01, x_center, y_center, radius], axis=1)
 
     pairwise = np.linalg.norm(coords[:, None, :] - coords[None, :, :], axis=-1)
     edge_pairs: list[tuple[int, int]] = []
@@ -1303,6 +1303,16 @@ def train_model(cfg: Config) -> tuple[dict[str, float], list[dict[str, float]]]:
             with autocast_context(device, cfg.use_amp):
                 outputs = model(xb, freq_axis_hz)
                 losses = physics_informed_loss(outputs, yb, freq_axis_hz, cfg, epoch)
+
+            if not torch.isfinite(losses.total):
+                scheduler.step()
+                print(
+                    "Epoch "
+                    f"{epoch:03d} | "
+                    f"batch {batch_idx:04d}/{len(train_loader):04d} | "
+                    "skipped non-finite loss"
+                )
+                continue
 
             scaler.scale(losses.total).backward()
             scaler.unscale_(optimizer)

@@ -663,7 +663,9 @@ def pointwise_physics_terms(
     cfg: Config,
 ) -> PointLossBreakdown:
     data = weights * F.smooth_l1_loss(pred_db, target_db, reduction="none")
-    s11_lin = torch.pow(pred_db.new_tensor(10.0), pred_db / 20.0)
+    with torch.amp.autocast("cuda", enabled=False):
+        pred_f32 = pred_db.float()
+        s11_lin = torch.pow(pred_f32.new_tensor(10.0), pred_f32 / 20.0)
     passive = F.relu(s11_lin - 1.0).pow(2)
     total = data + cfg.loss_passive * passive
     return PointLossBreakdown(total=total, data=data, passive=passive)

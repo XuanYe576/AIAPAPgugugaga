@@ -1,14 +1,16 @@
-"""Surface entry point for training and evaluation.
+"""Surface entry point for training and evaluation backends.
 
 Usage:
-  python3 main.py [R5O args...]
-  python3 main.py --model r55bs [R5.5B-s args...]
-  python3 main.py --usepinn [train] [PINN args...]
-  python3 main.py --model pinn [train] [PINN args...]
+  python3 Model/main.py [R5O args...]
+  python3 Model/main.py --model r55bs [R5.5B-s args...]
+  python3 Model/main.py --model lgbm [LightGBM args...]
+  python3 Model/main.py --usepinn [train] [PINN args...]
+  python3 Model/main.py --model pinn [train] [PINN args...]
 
 The script forwards the remaining arguments to the selected backend:
 - `Model/R5O.py` for the default non-PINN path
 - `Model/R5.5B-s.py` for the notebook-style non-PINN baseline
+- `Model/patch_antenna_ai_colab_GPT_R4_LightGBM_with_validation_excel.py` for LightGBM
 - `Model/Pinn/R5PINN_perF.py` for the PINN path
 """
 
@@ -24,6 +26,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 BACKEND_SCRIPTS = {
     "r5o": REPO_ROOT / "Model" / "R5O.py",
     "r55bs": REPO_ROOT / "Model" / "R5.5B-s.py",
+    "lgbm": REPO_ROOT / "Model" / "patch_antenna_ai_colab_GPT_R4_LightGBM_with_validation_excel.py",
     "pinn": REPO_ROOT / "Model" / "Pinn" / "R5PINN_perF.py",
 }
 PINN_COMMANDS = {"train", "inspect", "preprocess"}
@@ -31,11 +34,11 @@ PINN_COMMANDS = {"train", "inspect", "preprocess"}
 
 def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     parser = argparse.ArgumentParser(
-        description="Surface launcher for R5 and R5 PINN training.",
+        description="Surface launcher for R5, LightGBM, and PINN training.",
     )
     parser.add_argument(
         "--model",
-        choices=["r5o", "r55bs", "pinn"],
+        choices=["r5o", "r55bs", "lgbm", "pinn"],
         default="r5o",
         help="Select which training backend to launch.",
     )
