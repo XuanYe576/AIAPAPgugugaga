@@ -72,7 +72,8 @@ def _default_raw_data_root() -> Path:
 RAW_DATA_ROOT = _default_raw_data_root()
 
 from metrics.prediction_graphs import save_scalar_prediction_graphs
-from utils.dataP import preprocess_uploaded_dataset as build_processed_dataset
+from utils.adamw import create_optimizer as create_shared_optimizer
+from utils.amp import autocast_context, build_grad_scaler
 
 
 def _default_geometry_catalog_path() -> Path:
@@ -223,20 +224,12 @@ def require_torch(command_name: str) -> None:
 
 def create_optimizer(cfg: Config, parameters: object) -> object:
     require_torch("optimizer creation")
-    name = cfg.optimizer_name.lower()
-    if name == "adagrad":
-        return torch.optim.Adagrad(
-            parameters,
-            lr=cfg.lr,
-            weight_decay=cfg.weight_decay,
-        )
-    if name == "adamw":
-        return torch.optim.AdamW(
-            parameters,
-            lr=cfg.lr,
-            weight_decay=cfg.weight_decay,
-        )
-    raise ValueError(f"Unsupported optimizer: {cfg.optimizer_name}")
+    return create_shared_optimizer(
+        cfg.optimizer_name,
+        parameters,
+        lr=cfg.lr,
+        weight_decay=cfg.weight_decay,
+    )
 
 
 def save_config(cfg: Config) -> None:
@@ -283,6 +276,8 @@ def load_model_weights(model: nn.Module, checkpoint_path: Path, device: str) -> 
 
 
 def preprocess_uploaded_dataset(cfg: Config) -> dict[str, object]:
+    from utils.dataP import preprocess_uploaded_dataset as build_processed_dataset
+
     return build_processed_dataset(
         geometry_catalog_path=cfg.geometry_catalog_path,
         curves_root=cfg.curves_root,
@@ -299,11 +294,6 @@ class ProcessedCurveDataset:
     def __init__(self, csv_path: Path, meta_path: Path, sigma_db: float) -> None:
         if not csv_path.exists():
             raise FileNotFoundError(f"Processed CSV not found: {csv_path}")
-        if not meta_path.exists():
-            raise FileNotFoundError(f"Processed metadata not found: {meta_path}")
-
-        with meta_path.open(encoding="utf-8") as handle:
-            meta = json.load(handle)
         values = np.loadtxt(csv_path, delimiter=",", dtype=np.float32)
         if values.ndim == 1:
             values = values[None, :]
@@ -313,10 +303,22 @@ class ProcessedCurveDataset:
                 f"found {values.shape[1]}."
             )
 
+        inferred_seq_len = int(values.shape[1] - NUM_CELLS)
+        inferred_freq_axis = np.linspace(1.0, 6.0, inferred_seq_len, dtype=np.float32).tolist()
+        if meta_path.exists():
+            with meta_path.open(encoding="utf-8") as handle:
+                meta = json.load(handle)
+        else:
+            meta = {
+                "seq_len": inferred_seq_len,
+                "freq_axis_ghz": inferred_freq_axis,
+                "matched_antenna_ids": list(range(1, values.shape[0] + 1)),
+            }
+
         self.csv_path = csv_path
         self.meta_path = meta_path
         self.meta = meta
-        self.seq_len = int(meta["seq_len"])
+        self.seq_len = int(meta.get("seq_len", inferred_seq_len))
         if values.shape[1] != NUM_CELLS + self.seq_len:
             raise ValueError(
                 f"Processed CSV column count mismatch. Expected {NUM_CELLS + self.seq_len}, "
@@ -325,7 +327,10 @@ class ProcessedCurveDataset:
 
         self.geometry = torch.from_numpy((values[:, :NUM_CELLS] > 0.5).astype(np.float32))
         self.curves_db = torch.from_numpy(values[:, NUM_CELLS:])
-        self.freq_axis_ghz = torch.tensor(meta["freq_axis_ghz"], dtype=torch.float32)
+        freq_axis_ghz = meta.get("freq_axis_ghz", inferred_freq_axis)
+        if len(freq_axis_ghz) != self.seq_len:
+            freq_axis_ghz = inferred_freq_axis
+        self.freq_axis_ghz = torch.tensor(freq_axis_ghz, dtype=torch.float32)
         freq_min = float(self.freq_axis_ghz.min().item())
         freq_max = float(self.freq_axis_ghz.max().item())
         denom = max(freq_max - freq_min, 1e-6)
@@ -851,7 +856,7 @@ def train_model(cfg: Config) -> dict[str, float]:
     train_loader, val_loader, test_loader = build_dataloaders(base, cfg, device)
     model = build_model(cfg, device)
     optimizer = create_optimizer(cfg, model.parameters())
-    scaler = torch.cuda.amp.GradScaler(enabled=(device == "cuda" and cfg.use_amp))
+    scaler = build_grad_scaler(device, cfg.use_amp)
 
     history_rows: list[dict[str, float]] = []
     best_selection_total = float("inf")
@@ -894,8 +899,6 @@ def train_model(cfg: Config) -> dict[str, float]:
         per_freq_loss_sums = torch.zeros(base.seq_len, dtype=torch.float64)
         per_freq_loss_counts = torch.zeros(base.seq_len, dtype=torch.long)
         count = 0
-        amp_enabled = device == "cuda" and cfg.use_amp
-
         for batch_idx, (geom_bits, freq_norm, target_db, weights, freq_idx, _antenna_slot) in enumerate(
             train_loader,
             start=1,
@@ -907,7 +910,7 @@ def train_model(cfg: Config) -> dict[str, float]:
             freq_idx = freq_idx.to(dtype=torch.long)
 
             optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=amp_enabled):
+            with autocast_context(device, cfg.use_amp):
                 pred_db = model(geom_bits, freq_norm)
                 pointwise = pointwise_physics_terms(pred_db, target_db, weights, cfg)
                 losses = PointLossBreakdown(

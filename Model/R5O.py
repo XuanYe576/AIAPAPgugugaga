@@ -46,6 +46,8 @@ from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, Dataset, Subset
 
 from metrics.prediction_graphs import plot_loss_curve, save_complex_prediction_graphs
+from utils.adamw import create_optimizer as create_shared_optimizer
+from utils.amp import autocast_context, build_grad_scaler
 
 GRID_HEIGHT = 10
 GRID_WIDTH = 10
@@ -205,20 +207,12 @@ def get_device(name: str) -> str:
 
 
 def create_optimizer(cfg: Config, parameters: list[torch.nn.Parameter] | iter) -> torch.optim.Optimizer:
-    name = cfg.optimizer_name.lower()
-    if name == "adagrad":
-        return torch.optim.Adagrad(
-            parameters,
-            lr=cfg.lr,
-            weight_decay=cfg.weight_decay,
-        )
-    if name == "adamw":
-        return torch.optim.AdamW(
-            parameters,
-            lr=cfg.lr,
-            weight_decay=cfg.weight_decay,
-        )
-    raise ValueError(f"Unsupported optimizer: {cfg.optimizer_name}")
+    return create_shared_optimizer(
+        cfg.optimizer_name,
+        parameters,
+        lr=cfg.lr,
+        weight_decay=cfg.weight_decay,
+    )
 
 
 def infer_layout(column_count: int, requested_mode: str) -> LayoutInfo:
@@ -1259,7 +1253,7 @@ def train_model(cfg: Config) -> tuple[dict[str, float], list[dict[str, float]]]:
     model = build_model(cfg, device)
     optimizer = create_optimizer(cfg, model.parameters())
     scheduler = create_scheduler(optimizer, cfg, len(train_loader))
-    scaler = torch.cuda.amp.GradScaler(enabled=(device == "cuda" and cfg.use_amp))
+    scaler = build_grad_scaler(device, cfg.use_amp)
     freq_axis_hz = frequency_axis(cfg, device)
 
     history_rows: list[dict[str, float]] = []
@@ -1299,8 +1293,6 @@ def train_model(cfg: Config) -> tuple[dict[str, float], list[dict[str, float]]]:
             "smooth": 0.0,
         }
         count = 0
-        amp_enabled = device == "cuda" and cfg.use_amp
-
         for batch_idx, (xb, yb) in enumerate(train_loader, start=1):
             xb = xb.to(device)
             yb = yb.to(device)
@@ -1308,7 +1300,7 @@ def train_model(cfg: Config) -> tuple[dict[str, float], list[dict[str, float]]]:
                 xb = augment_geometry_batch(xb, cfg)
 
             optimizer.zero_grad(set_to_none=True)
-            with torch.cuda.amp.autocast(enabled=amp_enabled):
+            with autocast_context(device, cfg.use_amp):
                 outputs = model(xb, freq_axis_hz)
                 losses = physics_informed_loss(outputs, yb, freq_axis_hz, cfg, epoch)
 

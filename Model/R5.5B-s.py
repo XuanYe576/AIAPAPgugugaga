@@ -40,6 +40,7 @@ from metrics.prediction_graphs import (
     save_complex_prediction_graphs,
     save_real_channel_prediction_graphs,
 )
+from utils.adamw import create_optimizer as create_shared_optimizer
 
 GRID_HEIGHT = 10
 GRID_WIDTH = 10
@@ -403,12 +404,12 @@ class Geometry2SParam(nn.Module):
 
 
 def create_optimizer(cfg: Config, parameters) -> torch.optim.Optimizer:
-    name = cfg.optimizer_name.lower()
-    if name == "adagrad":
-        return torch.optim.Adagrad(parameters, lr=cfg.lr, weight_decay=cfg.weight_decay)
-    if name == "adamw":
-        return torch.optim.AdamW(parameters, lr=cfg.lr, weight_decay=cfg.weight_decay)
-    raise ValueError(f"Unsupported optimizer: {cfg.optimizer_name}")
+    return create_shared_optimizer(
+        cfg.optimizer_name,
+        parameters,
+        lr=cfg.lr,
+        weight_decay=cfg.weight_decay,
+    )
 
 
 def frequency_axis(cfg: Config, device: str) -> torch.Tensor:

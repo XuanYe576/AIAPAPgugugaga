@@ -1,35 +1,55 @@
 # AI-Assisted Patch Antenna Design Using a Hybrid Encoder-Decoder Architecture
 
-Assuming you mean the physics-informed PINN path, the actual backend is [`mainPAP/Model/Pinn/R5PINN_perF.py`](/Users/zhuowenfeng6626/Downloads/ProjectAntennaPatch/mainPAP/Model/Pinn/R5PINN_perF.py#L1), selected by [`mainPAP/Model/main.py`](/Users/zhuowenfeng6626/Downloads/ProjectAntennaPatch/mainPAP/Model/main.py#L34). The flow is:
+Modification version of Iman's Work from model R5, added surrogated physics
 
-- Preprocess raw geometry catalogs plus per-antenna S11 CSVs into one matrix of `[100 geometry bits + 61 dB points]` in [`mainPAP/Model/Pinn/R5PINN_perF.py`](/Users/zhuowenfeng6626/Downloads/ProjectAntennaPatch/mainPAP/Model/Pinn/R5PINN_perF.py#L350).
-- Expand each antenna into 61 point samples, so training becomes `(geometry, normalized frequency) -> dB(S11)` in [`mainPAP/Model/Pinn/R5PINN_perF.py`](/Users/zhuowenfeng6626/Downloads/ProjectAntennaPatch/mainPAP/Model/Pinn/R5PINN_perF.py#L418) and [`mainPAP/Model/Pinn/R5PINN_perF.py`](/Users/zhuowenfeng6626/Downloads/ProjectAntennaPatch/mainPAP/Model/Pinn/R5PINN_perF.py#L468).
-- Encode the 10x10 patch as a graph with node occupancy plus coordinate features, then fuse that geometry embedding with sinusoidal/polynomial frequency features before predicting one scalar dB value in [`mainPAP/Model/Pinn/R5PINN_perF.py`](/Users/zhuowenfeng6626/Downloads/ProjectAntennaPatch/mainPAP/Model/Pinn/R5PINN_perF.py#L490), [`mainPAP/Model/Pinn/R5PINN_perF.py`](/Users/zhuowenfeng6626/Downloads/ProjectAntennaPatch/mainPAP/Model/Pinn/R5PINN_perF.py#L621), and [`mainPAP/Model/Pinn/R5PINN_perF.py`](/Users/zhuowenfeng6626/Downloads/ProjectAntennaPatch/mainPAP/Model/Pinn/R5PINN_perF.py#L690).
+- `Model/R5O.py`: Original Model in Python
+- `Model/R5.5B-s.py`: Modified for PINN
+- `Model/Pinn/R5PINN_perF.py`: per-frequency physics-induced
 
-The “physics-informed” part is mostly in the loss, not in the forward model:
+## Antenna Setup
 
-- Resonance weighting upweights samples near the deepest S11 notch: [`mainPAP/Model/Pinn/R5PINN_perF.py`](/Users/zhuowenfeng6626/Downloads/ProjectAntennaPatch/mainPAP/Model/Pinn/R5PINN_perF.py#L463).
-- Passivity penalty punishes predicted positive dB values with `relu(pred_db)^2`, which encodes that passive antennas should have S11 in dB at or below 0: [`mainPAP/Model/Pinn/R5PINN_perF.py`](/Users/zhuowenfeng6626/Downloads/ProjectAntennaPatch/mainPAP/Model/Pinn/R5PINN_perF.py#L713).
-- Total loss is weighted SmoothL1 data fit plus the passivity term: [`mainPAP/Model/Pinn/R5PINN_perF.py`](/Users/zhuowenfeng6626/Downloads/ProjectAntennaPatch/mainPAP/Model/Pinn/R5PINN_perF.py#L725), used in training here: [`mainPAP/Model/Pinn/R5PINN_perF.py`](/Users/zhuowenfeng6626/Downloads/ProjectAntennaPatch/mainPAP/Model/Pinn/R5PINN_perF.py#L916).
+- Each antenna geometry is represented as a `10 x 10` binary metal grid, so each sample has `100` geometry bits.
+- The current preprocessing treats one cell as `15 mm x 15 mm`, so the represented patch canvas is `150 mm x 150 mm`.
+- The processed geometry order follows the historical `data` convention: flatten each `10 x 10` patch from bottom to top, left to right.
+- Each antenna has one S11 response file named `patch_<id>_s11_plot.csv`.
+- The current processed magnitude dataset stores `61` S11 values in dB per antenna. The exact frequency axis is saved in the matching metadata JSON.
+- The PINN resonance helper uses a simple substrate approximation with relative permittivity `er = 4.4` and substrate thickness `h = 1.57 mm`.
 
-Important nuance: this is not a classical PINN with Maxwell/PDE residuals or boundary-condition losses. There is no autograd-based physics residual in this file. It is better described as a physics-informed surrogate with soft physical constraints.
+## What The Data Is Based On
 
-## Repository layout
+- Raw geometry catalogs live under `Data/NotprocessedData/.../patch_antennas_updated*.csv`.
+- Raw S11 curves live under `Data/NotprocessedData/**/patch_*_s11_plot.csv`.
+- The default `60k` build uses `Data/NotprocessedData/60000 Patch Antenna File/patch_antennas_updated5b.csv`.
 
-- `Model/`: My edits
-- `Data/`: processed data to run and train.
-- `results/`: training outputs and saved analysis artifacts.
-- `introduction_and_pdfs/`: specifications, presentation material, reference notes, and images.
-- `utils/`: utility scripts.
+## How Data Is Processed
 
-## Current model families
+The main preprocessing utility is `utils/dataP.py`.
 
-- `GNN/GCN + FEDformer-style decoder`: graph encoder over the `10 x 10` layout with spectral and Transformer-style decoding.
-- `CNN + FEDformer-style decoder`: image-style geometry encoder with spectral sequence decoding.
-- `Tiny CNN regressor`: compact direct baseline without the FEDformer-style decoder.
-- `LightGBM baseline`: one regressor per frequency point as a non-neural baseline.
+It performs the following steps:
 
-## Setup
+1. Parse a raw geometry catalog and read each antenna as a `10 x 10` binary grid.
+2. Flip the grid vertically so the flattened output matches the historical `Ori_30k.csv` orientation.
+3. Scan `Data/NotprocessedData` for all `patch_<id>_s11_plot.csv` files.
+4. Match geometry IDs to curve IDs.
+5. Write one processed row per matched antenna as:
+   `[100 geometry bits] + [61 S11 dB samples]`
+6. Write a companion metadata JSON with the geometry catalog path, curve root, matched antenna IDs, duplicate IDs, missing IDs, grid size, sequence length, and frequency axis.
+
+The current default processed files are:
+
+- `Data/processed/Full_60000Data_61dB.csv`
+- `Data/processed/Full_60000Data_61dB.meta.json`
+
+## Models
+
+| Model | Script | Input and output | Main idea |
+| --- | --- | --- | --- |
+| R5O | `Model/R5O.py` | Processed CSV to full curve | GATv2-style graph encoder plus geometry-conditioned decoder with physics-informed losses |
+| R5.5B-s | `Model/R5.5B-s.py` | Processed CSV to full curve | Older notebook-style GraphConv plus spectral and Transformer decoder baseline |
+| R5 PINN | `Model/Pinn/R5PINN_perF.py` | Processed CSV to one dB value at one frequency | Per-frequency graph model with soft physics constraints |
+| LightGBM baseline | `Model/patch_antenna_ai_colab_GPT_R4_LightGBM_with_validation_excel.ipynb` | Processed CSV to 61 separate regressors | Fast tabular baseline with Excel export |
+
+## Environment Setup
 
 ```bash
 cd mainPAP
@@ -38,197 +58,212 @@ source .venv/bin/activate
 pip install numpy pandas matplotlib torch
 ```
 
-## Training Entry Point
+Notes:
 
-Use the surface launcher:
+- `numpy` is enough for preprocessing.
+- `torch` is required for training and evaluation.
+- `matplotlib` is required for plotting utilities.
+- `pandas` is used by `R5.5B-s.py`.
 
-```bash
-python3 main.py ...
-```
+## How To Run The Code
 
-`main.py` forwards to:
-
-- `Model/patch_antenna_ai_r5.py` for the non-PINN path
-- `Model/Pinn/R5PINN_perF.py` for the PINN path when `--usepinn` is present
-
-## Data Preparation
-
-For the uploaded `30000`-antenna raw dataset, preprocess once first:
+### Preprocess The 60k Raw Dataset
 
 ```bash
 cd mainPAP
-python3 main.py --usepinn preprocess --overwrite-processed
+python3 utils/dataP.py --overwrite
 ```
 
--->
-
-- `Data/processed/Full_data_61dB.csv`
-
-## Common Commands
-
-Train without PINN:
+Equivalent PINN entrypoint:
 
 ```bash
 cd mainPAP
-python3 main.py \
-  --csv-path Data/processed/Full_30000Data_61dB.csv \
-  --output-mode mag_only \
-  --epochs 80 \
-  --batch-size 32 \
-  --device auto
+python3 Model/Pinn/R5PINN_perF.py preprocess --overwrite-processed
 ```
 
-Train with PINN:
+### Inspect The Processed PINN Dataset
 
 ```bash
 cd mainPAP
-python3 main.py --usepinn \
+python3 Model/Pinn/R5PINN_perF.py inspect
+```
+
+### Train The PINN
+
+Direct script:
+
+```bash
+cd mainPAP
+python3 Model/Pinn/R5PINN_perF.py train \
   --epochs 80 \
   --batch-size 256 \
   --device auto
 ```
 
-Use Adagrad:
+Surface launcher:
 
 ```bash
-python3 main.py \
-  --csv-path Data/processed/Full_30000Data_61dB.csv \
-  --output-mode mag_only \
-  --optimizer adagrad
-```
-
-Use Adagrad with PINN:
-
-```bash
-python3 main.py --usepinn \
-  --optimizer adagrad
-```
-
-Print one training log every 10 batches:
-
-```bash
-python3 main.py \
-  --csv-path Data/processed/Full_30000Data_61dB.csv \
-  --output-mode mag_only \
-  --log-every-batches 10
-```
-
-Evaluate a saved checkpoint on validation:
-
-```bash
-python3 main.py \
-  --csv-path Data/processed/Full_30000Data_61dB.csv \
-  --output-mode mag_only \
-  --eval-split val
-```
-
-Evaluate a saved checkpoint on test:
-
-```bash
-python3 main.py --usepinn --eval-split test
-```
-
-Rebuild processed data and then train with PINN:
-
-```bash
-python3 main.py --usepinn \
-  --overwrite-processed \
+cd mainPAP
+python3 Model/main.py --usepinn \
   --epochs 80 \
-  --batch-size 256
+  --batch-size 256 \
+  --device auto
 ```
 
-## Logging And Checkpoints
+Evaluate a saved PINN checkpoint:
 
-Both backends now support:
+```bash
+cd mainPAP
+python3 Model/Pinn/R5PINN_perF.py --eval-split test
+```
 
-- `--optimizer adamw|adagrad`
-- `--log-every-batches N`
-- `--eval-split val|test`
-- checkpoint saving
-- history CSV logging
-- JSON summary output
+### Train R5O On The Magnitude-Only 60k Dataset
 
-Output locations:
+```bash
+cd mainPAP
+python3 Model/R5O.py \
+  --csv-path Data/processed/Full_60000Data_61dB.csv \
+  --output-mode mag_only \
+  --seq-len 61 \
+  --epochs 80 \
+  --batch-size 32 \
+  --device auto
+```
 
-- non-PINN: `results/patch_antenna_ai_r5/`
-- PINN: `results/R5PINN_perF/`
+Evaluate a saved R5O checkpoint:
 
-Checkpoint behavior:
+```bash
+cd mainPAP
+python3 Model/R5O.py \
+  --csv-path Data/processed/Full_60000Data_61dB.csv \
+  --output-mode mag_only \
+  --seq-len 61 \
+  --eval-split test
+```
 
-- the best model is chosen by validation loss
-- a checkpoint file and model weights are saved when validation improves
-- validation or test can be rerun later from the saved checkpoint
+### Train R5.5B-s On The Magnitude-Only 60k Dataset
 
-## Metrics Visualization
+```bash
+cd mainPAP
+python3 Model/R5.5B-s.py \
+  --csv-path Data/processed/Full_60000Data_61dB.csv \
+  --output-mode mag_only \
+  --epochs 50 \
+  --batch-size 64 \
+  --device auto
+```
 
-Use the metrics script to turn saved `history.csv` and `summary.json` files into figures:
+Evaluate a saved R5.5B-s checkpoint:
+
+```bash
+cd mainPAP
+python3 Model/R5.5B-s.py \
+  --csv-path Data/processed/Full_60000Data_61dB.csv \
+  --output-mode mag_only \
+  --eval-split test
+```
+
+### Launcher Shortcuts
+
+`Model/main.py` now supports all current backends:
+
+- default: `R5O`
+- `--model r55bs`: `R5.5B-s`
+- `--model pinn` or `--usepinn`: `R5PINN_perF`
+
+Examples:
+
+```bash
+cd mainPAP
+python3 Model/main.py --epochs 80
+python3 Model/main.py --model r55bs --epochs 50
+python3 Model/main.py --usepinn --epochs 80 --batch-size 256
+```
+
+## What The PINN Includes
+
+`Model/Pinn/R5PINN_perF.py` is physics-informed in the soft-constraint surrogate sense. It is not a Maxwell-residual PDE PINN.
+
+The current PINN includes these perspectives:
+
+- Geometry perspective: a graph encoder over the `10 x 10` metal grid, with metal and void occupancy plus coordinate features.
+- Frequency perspective: normalized frequency is encoded with polynomial and sinusoidal features before fusion with the geometry embedding.
+- Data-fit perspective: training predicts one scalar `dB(S11)` value for one frequency point at a time using weighted SmoothL1 loss.
+- Resonance perspective: samples near the deepest notch receive larger weights, and validation also computes a resonance loss from the predicted notch frequency versus a theoretical resonance estimated from extracted patch length.
+- Passivity perspective: the loss penalizes `|S11| > 1` in linear magnitude, not just positive dB values.
+- Substrate perspective: theoretical resonance uses a simple closed-form patch formula with `er = 4.4` and `h = 1.57 mm`.
+- Generalization perspective: train, validation, and test sets are split by inferred geometry families rather than by naive random leakage.
+
+In short, the PINN is best described as:
+
+- `geometry + normalized_frequency -> dB(S11)`
+- graph-based
+- per-frequency
+- physics-informed by passivity and resonance consistency
+- not a full electromagnetic field solver
+
+## Results, Utilities, And Metrics
+
+### Main Output Files
+
+`R5PINN_perF.py` writes to `results/R5PINN_perF/`:
+
+- `history.csv`: per-epoch training and validation metrics
+- `loss_per_freq.csv`: average pointwise training loss per frequency bin for each epoch
+- `summary.json`: best validation metrics and final test metrics
+- `config.json`: saved run configuration
+- `weight/graphical/*.png`: predicted versus target S11 curves for selected samples
+
+`R5O.py` writes to `results/patch_antenna_ai_r5/`:
+
+- `history.csv`
+- `summary.json`
+- `loss_curve.png`
+- `weight/graphical/*.png`
+- `weight/excel/val_predictions.xlsx` or `test_predictions.xlsx`
+
+`R5.5B-s.py` writes to `results/R5.5B-s/`:
+
+- `history.csv`
+- `summary.json`
+- `loss_curve.png`
+- `weight/graphical/*.png`
+
+### What The Metrics Mean
+
+Common metrics:
+
+- `train_total`, `val_total`, `test_total`: overall objective used by that script
+- `mae` or `db_mae`: average absolute dB error
+- `passive`: penalty for violating passivity
+- `complex_mse`: normalized complex-domain error for complex-output models
+- `notch`: resonance-target term used by `R5O.py`
+- `smooth`: curve smoothness penalty used by `R5O.py`
+
+PINN-specific metrics:
+
+- `train_data`, `val_data`, `test_data`: weighted SmoothL1 data-fit term
+- `val_resonance_loss`, `test_resonance_loss`: mismatch between predicted notch frequency and the simple substrate-based theoretical resonance
+- `val_selection_total`, `test_selection_total`: total metric plus `resonance_loss_weight * resonance_loss`
+
+### Utility Scripts
+
+- `utils/dataP.py`: rebuilds processed CSV and metadata from the raw folder tree
+- `metrics/prediction_graphs.py`: saves loss curves and prediction-versus-target S11 plots
+- `metrics/visualize_results.py`: reads `history.csv` and `summary.json`, then creates per-run dashboards and cross-run comparison plots
+- `metrics/plotting.py`: central `matplotlib` loader with the non-interactive `Agg` backend
+
+### Visualize Saved Runs
 
 ```bash
 cd mainPAP
 python3 metrics/visualize_results.py
 ```
 
-Optional:
-
-- `--run-dir results/patch_antenna_ai_r5`
-- `--run-dir results/R5PINN_perF`
-- `--output-dir metrics/figures`
-
-The script creates:
-
-- one dashboard PNG per run
-- one comparison PNG when multiple runs are available
-
-## GitHub setup
-
-GitHub usually recommends every repository include a `README`, `LICENSE`, and `.gitignore`. This repo now has a readable project README. A `LICENSE` can still be added later if you want the repository to be publicly reusable under explicit terms.
-
-### Create a new repository on the command line
+Optional examples:
 
 ```bash
-echo "# -AI-Assisted-Patch-Antenna-Design-Using-a-Hybrid-Encoder-Decoder-Architecture" >> README.md
-git init
-git add README.md
-git commit -m "first commit"
-git branch -M main
-git remote add origin git@github.com:XuanYe576/-AI-Assisted-Patch-Antenna-Design-Using-a-Hybrid-Encoder-Decoder-Architecture.git
-git push -u origin main
+python3 metrics/visualize_results.py --run-dir results/R5PINN_perF
+python3 metrics/visualize_results.py --run-dir results/patch_antenna_ai_r5
+python3 metrics/visualize_results.py --output-dir metrics/figures
 ```
-
-### Push an existing repository from the command line
-
-```bash
-git remote add origin git@github.com:XuanYe576/-AI-Assisted-Patch-Antenna-Design-Using-a-Hybrid-Encoder-Decoder-Architecture.git
-git branch -M main
-git push -u origin main
-```
-
-## Citations
-
-Main method families referenced by the codebase:
-
-1. Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit, Llion Jones, Aidan N. Gomez, Lukasz Kaiser, and Illia Polosukhin. "Attention Is All You Need." arXiv, 2017. https://arxiv.org/abs/1706.03762
-2. Thomas N. Kipf and Max Welling. "Semi-Supervised Classification with Graph Convolutional Networks." OpenReview, 2017. https://openreview.net/forum?id=SJU4ayYgl
-3. Tian Zhou, Ziqing Ma, Qingsong Wen, Xue Wang, Liang Sun, and Rong Jin. "FEDformer: Frequency Enhanced Decomposed Transformer for Long-term Series Forecasting." Proceedings of Machine Learning Research, 2022. https://proceedings.mlr.press/v162/zhou22g.html
-4. Guolin Ke, Qi Meng, Thomas Finley, Taifeng Wang, Wei Chen, Weidong Ma, Qiwei Ye, and Tie-Yan Liu. "LightGBM: A Highly Efficient Gradient Boosting Decision Tree." NeurIPS, 2017. https://papers.nips.cc/paper_files/paper/2017/hash/6449f44a102fde848669bdd9eb6b76fa-Abstract.html
-
-## Current baseline note
-
-`Model/patch_antenna_ai_r5.py` is the current cleaned baseline in this repo snapshot. It trains a graph-based encoder plus FEDformer-style decoder for `61` S11 samples and supports `mag_only` or `complex_61` output formatting depending on the CSV layout.
-
-
-
-
-"""
-Summary of changes for the PINN NaN loss:
-Sanitize curves_db in ProcessedCurveDataset
-After loading the CSV, non-finite values in the dB columns are replaced and then clamped:
-torch.where(torch.isfinite(...), curves_db, -80.0) so nan/-inf become -80 dB
-torch.clamp(..., min=-80, max=0) so all values stay in [-80, 0] and +inf becomes 0
-That way targets and weights are always finite even if the source data had log(0) or bad values.
-Safe resonance_weights_db
-The divisor is now max(sigma_db, 1e-6) so the weight computation never divides by zero.
-Defensive pointwise_physics_loss
-The data term is wrapped in torch.nan_to_num(..., nan=0.0, posinf=0.0, neginf=0.0) so any remaining non-finite value in the loss is replaced and training doesn’t get a NaN loss.
-Re-run PINN training (e.g. cd /home/ubuntu/A && ./run_pinn_then_nopinn_tmux.sh, then tmux attach -t antenna). The data loss and total loss should stay finite. If the CSV was already written with -inf/nan, the in-memory sanitization will fix it; if you prefer a clean file on disk, you can re-run preprocessing after these code changes so the processed CSV itself has no non-finite values.
-"""
