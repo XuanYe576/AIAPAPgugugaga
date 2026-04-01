@@ -1,0 +1,49 @@
+{
+  "available_checkpoints": {
+    "R5O_no_PINN": "/Users/zhuowenfeng6626/Downloads/ProjectAntennaPatch/mainPAP/results/R5O_no_PINN/gnn_fedformer_r5_full_best.pt"
+  },
+  "missing_checkpoints": {
+    "R5O_with_PINN": "No .pt/.ckpt file exists under mainPAP/results/R5O_with_PINN in this workspace."
+  },
+  "r5o_unexpected_auxiliary_keys": [
+    "decoder.summary_proj.0.weight",
+    "decoder.summary_proj.0.bias",
+    "decoder.summary_proj.1.weight",
+    "decoder.summary_proj.1.bias",
+    "decoder.f0_head.weight",
+    "decoder.f0_head.bias",
+    "decoder.bw_head.weight",
+    "decoder.bw_head.bias"
+  ],
+  "antennas": [
+    {
+      "antenna_id": 30001,
+      "model": "R5O_no_PINN",
+      "mae_db": 10.247410774230957,
+      "rmse_db": 13.555142402648926,
+      "actual_min_db": -14.49170207977295,
+      "actual_min_freq_ghz": 3.5,
+      "pred_min_db": -40.0090446472168,
+      "pred_min_freq_ghz": 1.0
+    },
+    {
+      "antenna_id": 30002,
+      "model": "R5O_no_PINN",
+      "mae_db": 23.78792381286621,
+      "rmse_db": 25.616376876831055,
+      "actual_min_db": -0.35410335659980774,
+      "actual_min_freq_ghz": 6.0,
+      "pred_min_db": -51.15158462524414,
+      "pred_min_freq_ghz": 1.0
+    }
+  ],
+  "artifacts": {
+    "overview_plot": "/Users/zhuowenfeng6626/Downloads/ProjectAntennaPatch/mainPAP/results/inference_30001_30002/patch_30001_30002_r5o_no_pinn_overview.png",
+    "per_antenna_plots": [
+      "/Users/zhuowenfeng6626/Downloads/ProjectAntennaPatch/mainPAP/results/inference_30001_30002/patch_30001_r5o_no_pinn.png",
+      "/Users/zhuowenfeng6626/Downloads/ProjectAntennaPatch/mainPAP/results/inference_30001_30002/patch_30002_r5o_no_pinn.png"
+    ],
+    "summary_csv": "/Users/zhuowenfeng6626/Downloads/ProjectAntennaPatch/mainPAP/results/inference_30001_30002/summary.csv",
+    "predictions_long_csv": "/Users/zhuowenfeng6626/Downloads/ProjectAntennaPatch/mainPAP/results/inference_30001_30002/predictions_long.csv"
+  }
+}

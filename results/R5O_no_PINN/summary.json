@@ -1,0 +1,15 @@
+{
+  "best_epoch": 25,
+  "best_val_total": 1.9934383362664116,
+  "test_total": NaN,
+  "test_complex_mse": NaN,
+  "test_db_mae": NaN,
+  "test_notch": 0.08766874365011851,
+  "test_passive": 0.02575927649227621,
+  "test_smooth": 0.07350706980625789,
+  "layout": "mag_only",
+  "seq_len": 61,
+  "prediction_graphical_dir": "weights/R5O_no_PINN/weight/graphical/test",
+  "prediction_excel_path": "weights/R5O_no_PINN/weight/excel/test_predictions.xlsx",
+  "prediction_graph_count": 12
+}
