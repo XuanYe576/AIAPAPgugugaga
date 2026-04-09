@@ -133,6 +133,7 @@ class Config:
     graph_k: int = 8
     dropout: float = 0.10
     loss_passive: float = 0.10
+    loss_notch: float = 0.10
     resonance_loss_weight: float = 0.10
     notch_sigma_db: float = 4.0
     patience: int = 12
@@ -411,6 +412,25 @@ def resonance_frequency_loss(
     return (pred_notch_ghz[finite] - theory_notch_ghz[finite]).pow(2).mean()
 
 
+def derive_notch_targets_db(
+    curves_db: torch.Tensor,
+    freq_axis_ghz: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    min_indices = curves_db.argmin(dim=1)
+    notch_ghz = freq_axis_ghz[min_indices]
+
+    bandwidths: list[torch.Tensor] = []
+    for sample_idx in range(curves_db.size(0)):
+        mask = curves_db[sample_idx] <= -10.0
+        active = torch.where(mask)[0]
+        if active.numel() == 0:
+            bandwidths.append(torch.zeros((), device=curves_db.device, dtype=curves_db.dtype))
+        else:
+            bandwidths.append(freq_axis_ghz[active[-1]] - freq_axis_ghz[active[0]])
+    bandwidth_ghz = torch.stack(bandwidths)
+    return notch_ghz, bandwidth_ghz
+
+
 class PerFrequencyDataset(Dataset):
     def __init__(self, base: ProcessedCurveDataset, antenna_indices: list[int]) -> None:
         self.base = base
@@ -649,11 +669,18 @@ class R5PINNPerFrequency(nn.Module):
             nn.Linear(cfg.fusion_hidden_dim // 2, 1),
         )
 
-    def forward(self, geom_bits: torch.Tensor, freq_norm: torch.Tensor) -> torch.Tensor:
-        geom_embedding = self.encoder(geom_bits)
+    def forward_from_embedding(
+        self,
+        geom_embedding: torch.Tensor,
+        freq_norm: torch.Tensor,
+    ) -> torch.Tensor:
         freq_embedding = self.freq_encoder(freq_norm)
         fused = torch.cat([geom_embedding, freq_embedding], dim=-1)
         return self.head(fused).squeeze(-1)
+
+    def forward(self, geom_bits: torch.Tensor, freq_norm: torch.Tensor) -> torch.Tensor:
+        geom_embedding = self.encoder(geom_bits)
+        return self.forward_from_embedding(geom_embedding, freq_norm)
 
 
 def pointwise_physics_terms(
@@ -683,6 +710,20 @@ def pointwise_physics_loss(
         data=pointwise.data.mean(),
         passive=pointwise.passive.mean(),
     )
+
+
+def notch_bandwidth_loss(
+    pred_curves_db: torch.Tensor,
+    target_curves_db: torch.Tensor,
+    freq_axis_ghz: torch.Tensor,
+) -> torch.Tensor:
+    pred_notch_ghz, pred_bw_ghz = derive_notch_targets_db(pred_curves_db, freq_axis_ghz)
+    target_notch_ghz, target_bw_ghz = derive_notch_targets_db(target_curves_db, freq_axis_ghz)
+    freq_span = float((freq_axis_ghz[-1] - freq_axis_ghz[0]).item())
+    return (
+        torch.abs(pred_notch_ghz - target_notch_ghz).mean()
+        + torch.abs(pred_bw_ghz - target_bw_ghz).mean()
+    ) / max(freq_span, 1.0e-6)
 
 
 def infer_family_key(bits: torch.Tensor) -> tuple[int, ...]:
@@ -793,6 +834,7 @@ def evaluate_model(
     count = 0
     dataset = loader.dataset
     pred_curves = None
+    target_curves = None
     geom_subset = None
     freq_axis_ghz = None
     if isinstance(dataset, PerFrequencyDataset):
@@ -802,6 +844,7 @@ def evaluate_model(
             dtype=torch.float32,
         )
         geom_subset = dataset.base.geometry[dataset.antenna_indices].detach().cpu()
+        target_curves = dataset.base.curves_db[dataset.antenna_indices].detach().cpu()
         freq_axis_ghz = dataset.base.freq_axis_ghz.detach().cpu()
     with torch.no_grad():
         for geom_bits, freq_norm, target_db, weights, freq_idx, antenna_slot in loader:
@@ -825,14 +868,25 @@ def evaluate_model(
                 ] = pred_db.detach().cpu()
 
     metrics = {key: value / max(1, count) for key, value in totals.items()}
-    if pred_curves is not None and geom_subset is not None and freq_axis_ghz is not None:
+    if (
+        pred_curves is not None
+        and target_curves is not None
+        and geom_subset is not None
+        and freq_axis_ghz is not None
+    ):
+        metrics["notch"] = float(
+            notch_bandwidth_loss(pred_curves, target_curves, freq_axis_ghz).item()
+        )
         metrics["resonance_loss"] = float(
             resonance_frequency_loss(geom_subset, pred_curves, freq_axis_ghz).item()
         )
     else:
+        metrics["notch"] = 0.0
         metrics["resonance_loss"] = 0.0
     metrics["selection_total"] = (
-        metrics["total"] + cfg.resonance_loss_weight * metrics["resonance_loss"]
+        metrics["total"]
+        + cfg.loss_notch * metrics["notch"]
+        + cfg.resonance_loss_weight * metrics["resonance_loss"]
     )
     return metrics
 
@@ -863,6 +917,7 @@ def train_model(cfg: Config) -> dict[str, float]:
     history_rows: list[dict[str, float]] = []
     best_selection_total = float("inf")
     best_val_total = float("inf")
+    best_val_notch = float("inf")
     best_val_resonance = float("inf")
     best_epoch = 0
     patience_left = cfg.patience
@@ -878,6 +933,7 @@ def train_model(cfg: Config) -> dict[str, float]:
                 "val_total",
                 "val_data",
                 "val_passive",
+                "val_notch",
                 "val_mae",
                 "val_resonance_loss",
                 "val_selection_total",
@@ -970,6 +1026,7 @@ def train_model(cfg: Config) -> dict[str, float]:
             "val_total": val_metrics["total"],
             "val_data": val_metrics["data"],
             "val_passive": val_metrics["passive"],
+            "val_notch": val_metrics["notch"],
             "val_mae": val_metrics["mae"],
             "val_resonance_loss": val_metrics["resonance_loss"],
             "val_selection_total": val_metrics["selection_total"],
@@ -987,6 +1044,7 @@ def train_model(cfg: Config) -> dict[str, float]:
                     row["val_total"],
                     row["val_data"],
                     row["val_passive"],
+                    row["val_notch"],
                     row["val_mae"],
                     row["val_resonance_loss"],
                     row["val_selection_total"],
@@ -1001,6 +1059,7 @@ def train_model(cfg: Config) -> dict[str, float]:
             f"{epoch:03d} | "
             f"train {row['train_total']:.6f} | "
             f"val {row['val_total']:.6f} | "
+            f"notch {row['val_notch']:.6f} | "
             f"res {row['val_resonance_loss']:.6f} | "
             f"select {row['val_selection_total']:.6f} | "
             f"mae {row['val_mae']:.6f}"
@@ -1009,6 +1068,7 @@ def train_model(cfg: Config) -> dict[str, float]:
         if row["val_selection_total"] < best_selection_total - 1e-6:
             best_selection_total = row["val_selection_total"]
             best_val_total = row["val_total"]
+            best_val_notch = row["val_notch"]
             best_val_resonance = row["val_resonance_loss"]
             best_epoch = epoch
             save_checkpoint(cfg, model, optimizer, epoch, best_selection_total)
@@ -1036,11 +1096,13 @@ def train_model(cfg: Config) -> dict[str, float]:
     summary = {
         "best_epoch": best_epoch,
         "best_val_total": best_val_total,
+        "best_val_notch": best_val_notch,
         "best_val_resonance_loss": best_val_resonance,
         "best_val_selection_total": best_selection_total,
         "test_total": test_metrics["total"],
         "test_data": test_metrics["data"],
         "test_passive": test_metrics["passive"],
+        "test_notch": test_metrics["notch"],
         "test_mae": test_metrics["mae"],
         "test_resonance_loss": test_metrics["resonance_loss"],
         "test_selection_total": test_metrics["selection_total"],

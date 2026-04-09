@@ -1,10 +1,10 @@
 # AI-Assisted Patch Antenna Design Using a Hybrid Encoder-Decoder Architecture
 
-Modification version of Iman's Work from model R5, added surrogated physics
+Current repo layout for the R5O, R5.5B-s, PINN, and LightGBM training pipelines.
 
-- `Model/R5O.py`: Original Model in Python
-- `Model/R5.5B-s.py`: Modified for PINN
-- `Model/Pinn/R5PINN_perF.py`: per-frequency physics-induced
+- `Model/R5O.py`: architecture-only non-PINN baseline
+- `Model/R5.5B-s.py`: older notebook-style neural baseline
+- `Model/Pinn/R5PINN_perF.py`: per-frequency PINN path with physics-guided loss
 
 ## Antenna Setup
 
@@ -44,7 +44,7 @@ The current default processed files are:
 
 | Model | Script | Input and output | Main idea |
 | --- | --- | --- | --- |
-| R5O | `Model/R5O.py` | Processed CSV to full curve | GATv2-style graph encoder plus geometry-conditioned decoder with physics-informed losses |
+| R5O | `Model/R5O.py` | Processed CSV to full curve | GATv2-style graph encoder plus geometry-conditioned decoder trained as the non-PINN architecture baseline |
 | R5.5B-s | `Model/R5.5B-s.py` | Processed CSV to full curve | Older notebook-style GraphConv plus spectral and Transformer decoder baseline |
 | R5 PINN | `Model/Pinn/R5PINN_perF.py` | Processed CSV to one dB value at one frequency | Per-frequency graph model with soft physics constraints |
 | LightGBM baseline | `Model/patch_antenna_ai_colab_GPT_R4_LightGBM_with_validation_excel.ipynb` | Processed CSV to 61 separate regressors | Fast tabular baseline with Excel export |
@@ -189,7 +189,8 @@ The current PINN includes these perspectives:
 - Geometry perspective: a graph encoder over the `10 x 10` metal grid, with metal and void occupancy plus coordinate features.
 - Frequency perspective: normalized frequency is encoded with polynomial and sinusoidal features before fusion with the geometry embedding.
 - Data-fit perspective: training predicts one scalar `dB(S11)` value for one frequency point at a time using weighted SmoothL1 loss.
-- Resonance perspective: samples near the deepest notch receive larger weights, and validation also computes a resonance loss from the predicted notch frequency versus a theoretical resonance estimated from extracted patch length.
+- Notch perspective: samples near the deepest notch receive larger weights during pointwise training, and validation reconstructs full curves to measure notch-frequency and `-10 dB` bandwidth mismatch.
+- Resonance perspective: validation also reconstructs full curves and computes a resonance loss from the predicted notch frequency versus a theoretical resonance estimated from extracted patch length.
 - Passivity perspective: the loss penalizes `|S11| > 1` in linear magnitude, not just positive dB values.
 - Substrate perspective: theoretical resonance uses a simple closed-form patch formula with `er = 4.4` and `h = 1.57 mm`.
 - Generalization perspective: train, validation, and test sets are split by inferred geometry families rather than by naive random leakage.
@@ -236,15 +237,15 @@ Common metrics:
 - `train_total`, `val_total`, `test_total`: overall objective used by that script
 - `mae` or `db_mae`: average absolute dB error
 - `passive`: penalty for violating passivity
-- `complex_mse`: normalized complex-domain error for complex-output models
-- `notch`: resonance-target term used by `R5O.py`
-- `smooth`: curve smoothness penalty used by `R5O.py`
+- `complex_mse`: complex-domain reconstruction error for complex-output models
 
 PINN-specific metrics:
 
 - `train_data`, `val_data`, `test_data`: weighted SmoothL1 data-fit term
+- `val_notch`, `test_notch`: notch-frequency and bandwidth mismatch term from reconstructed validation/test curves
 - `val_resonance_loss`, `test_resonance_loss`: mismatch between predicted notch frequency and the simple substrate-based theoretical resonance
-- `val_selection_total`, `test_selection_total`: total metric plus `resonance_loss_weight * resonance_loss`
+- `passive`: passivity penalty used by `R5PINN_perF.py`
+- `val_selection_total`, `test_selection_total`: total metric plus `loss_notch * notch + resonance_loss_weight * resonance_loss`
 
 ### Utility Scripts
 

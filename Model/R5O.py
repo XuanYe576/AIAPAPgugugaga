@@ -1,14 +1,13 @@
-"""Patch Antenna AI R5.
+"""Patch Antenna AI R5O.
 
-Full R5 physics-informed surrogate aligned with the design intent captured in
+Architecture-focused R5 surrogate aligned with the design intent captured in
 `old/C.md`:
 
 - geometry -> k-NN graph with geometry-derived node and edge features
 - 3-layer GATv2-style graph encoder with global attention pooling
 - geometry token + learned frequency tokens -> geometry-conditioned FEDformer
 - complex-valued output head predicting [Re(Gamma), Im(Gamma)] per frequency
-- physics-informed loss with complex MSE, dB loss, notch weighting, passivity,
-  smoothness, and resonance-aware auxiliary heads
+- plain complex reconstruction loss for non-PINN ablations
 
 The script keeps backward compatibility with legacy datasets through explicit
 layout flags, but the default target structure is the full 122-point complex
@@ -111,13 +110,6 @@ class Config:
     use_amp: bool = True
     curriculum_epochs: int = 80
     curriculum_stride: int = 2
-    loss_complex: float = 1.0
-    loss_db: float = 0.25
-    loss_notch: float = 0.10
-    loss_passive: float = 0.10
-    loss_smooth: float = 0.02
-    notch_sigma_db: float = 4.0
-    passive_limit: float = 1.0
     device: str = "auto"
     eval_split: str = ""
     prediction_plot_count: int = 12
@@ -180,9 +172,6 @@ class LossBreakdown:
     total: torch.Tensor
     complex_mse: torch.Tensor
     db_mae: torch.Tensor
-    notch: torch.Tensor
-    passive: torch.Tensor
-    smooth: torch.Tensor
 
 
 SUPPORTED_LAYOUTS: dict[str, LayoutInfo] = {
@@ -574,13 +563,6 @@ class FEDformerDecoder(nn.Module):
         )
         self.out_norm = nn.LayerNorm(cfg.dmodel)
         self.output_head = nn.Linear(cfg.dmodel, 2)
-        self.summary_proj = nn.Sequential(
-            nn.LayerNorm(cfg.dmodel * 2),
-            nn.Linear(cfg.dmodel * 2, cfg.dmodel),
-            nn.GELU(),
-        )
-        self.f0_head = nn.Linear(cfg.dmodel, 1)
-        self.bw_head = nn.Linear(cfg.dmodel, 1)
 
     def forward(
         self,
@@ -600,19 +582,7 @@ class FEDformerDecoder(nn.Module):
         freq_states = self.refinement(freq_states)
         freq_states = self.out_norm(freq_states)
         gamma = self.output_head(freq_states)
-
-        summary = torch.cat([geom_context.squeeze(1), freq_states.mean(dim=1)], dim=-1)
-        summary = self.summary_proj(summary)
-        freq_min = float(freq_axis_hz[0].item())
-        freq_span = float((freq_axis_hz[-1] - freq_axis_hz[0]).item())
-        f0_hz = freq_min + torch.sigmoid(self.f0_head(summary)).squeeze(-1) * freq_span
-        bw_hz = torch.sigmoid(self.bw_head(summary)).squeeze(-1) * freq_span
-
-        return {
-            "gamma": gamma,
-            "f0_hz": f0_hz,
-            "bw_hz": bw_hz,
-        }
+        return {"gamma": gamma}
 
 
 class Geometry2ComplexGamma(nn.Module):
@@ -774,46 +744,13 @@ def write_simple_xlsx(path: Path, sheets: list[tuple[str, list[list[object]]]]) 
     return path
 
 
-def resonance_weights(target_gamma: torch.Tensor, sigma_db: float) -> torch.Tensor:
-    target_db = gamma_db(target_gamma)
-    minima = target_db.min(dim=1, keepdim=True).values
-    return 1.0 + 2.0 * torch.exp(-((target_db - minima) / sigma_db) ** 2)
-
-
-def derive_notch_targets(
-    target_gamma: torch.Tensor,
-    freq_axis_hz: torch.Tensor,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    target_db = gamma_db(target_gamma)
-    min_indices = target_db.argmin(dim=1)
-    f0_hz = freq_axis_hz[min_indices]
-
-    bandwidths: list[torch.Tensor] = []
-    for sample_idx in range(target_db.size(0)):
-        mask = target_db[sample_idx] <= -10.0
-        active = torch.where(mask)[0]
-        if active.numel() == 0:
-            bandwidths.append(torch.zeros((), device=target_gamma.device))
-        else:
-            bandwidths.append(freq_axis_hz[active[-1]] - freq_axis_hz[active[0]])
-    bw_hz = torch.stack(bandwidths)
-    return f0_hz, bw_hz
-
-
-def smoothness_penalty(pred_gamma: torch.Tensor) -> torch.Tensor:
-    if pred_gamma.size(1) < 3:
-        return pred_gamma.new_zeros(())
-    second_diff = pred_gamma[:, 2:, :] - 2.0 * pred_gamma[:, 1:-1, :] + pred_gamma[:, :-2, :]
-    return second_diff.pow(2).mean()
-
-
 def curriculum_slice(cfg: Config, epoch: int) -> slice:
     if cfg.curriculum_stride > 1 and epoch <= cfg.curriculum_epochs:
         return slice(None, None, cfg.curriculum_stride)
     return slice(None, None, 1)
 
 
-def physics_informed_loss(
+def reconstruction_loss(
     outputs: dict[str, torch.Tensor],
     target_gamma: torch.Tensor,
     freq_axis_hz: torch.Tensor,
@@ -825,38 +762,14 @@ def physics_informed_loss(
     pred_used = pred_gamma[:, freq_subset, :]
     target_used = target_gamma[:, freq_subset, :]
 
-    weights = resonance_weights(target_used, sigma_db=cfg.notch_sigma_db)
-    sq_error = (pred_used - target_used).pow(2).sum(dim=-1)
-    denom = target_used.pow(2).sum(dim=-1).clamp_min(1e-6)
-    complex_mse = (weights * (sq_error / denom)).mean()
-
+    complex_mse = F.mse_loss(pred_used, target_used)
     db_error = torch.abs(gamma_db(pred_used) - gamma_db(target_used))
-    db_mae = (weights * db_error).mean()
-
-    f0_target, bw_target = derive_notch_targets(target_gamma, freq_axis_hz)
-    freq_span = float((freq_axis_hz[-1] - freq_axis_hz[0]).item())
-    notch = (
-        torch.abs(outputs["f0_hz"] - f0_target).mean()
-        + torch.abs(outputs["bw_hz"] - bw_target).mean()
-    ) / max(freq_span, 1.0)
-
-    passive = torch.relu(gamma_magnitude(pred_gamma) - cfg.passive_limit).pow(2).mean()
-    smooth = smoothness_penalty(pred_gamma)
-
-    total = (
-        cfg.loss_complex * complex_mse
-        + cfg.loss_db * db_mae
-        + cfg.loss_notch * notch
-        + cfg.loss_passive * passive
-        + cfg.loss_smooth * smooth
-    )
+    db_mae = db_error.mean()
+    total = complex_mse
     return LossBreakdown(
         total=total,
         complex_mse=complex_mse,
         db_mae=db_mae,
-        notch=notch,
-        passive=passive,
-        smooth=smooth,
     )
 
 
@@ -1108,9 +1021,6 @@ def evaluate_model(
         "total": 0.0,
         "complex_mse": 0.0,
         "db_mae": 0.0,
-        "notch": 0.0,
-        "passive": 0.0,
-        "smooth": 0.0,
     }
     count = 0
     with torch.no_grad():
@@ -1118,14 +1028,11 @@ def evaluate_model(
             xb = xb.to(device)
             yb = yb.to(device)
             outputs = model(xb, freq_axis_hz)
-            losses = physics_informed_loss(outputs, yb, freq_axis_hz, cfg, epoch)
+            losses = reconstruction_loss(outputs, yb, freq_axis_hz, cfg, epoch)
             batch_size = xb.size(0)
             totals["total"] += losses.total.item() * batch_size
             totals["complex_mse"] += losses.complex_mse.item() * batch_size
             totals["db_mae"] += losses.db_mae.item() * batch_size
-            totals["notch"] += losses.notch.item() * batch_size
-            totals["passive"] += losses.passive.item() * batch_size
-            totals["smooth"] += losses.smooth.item() * batch_size
             count += batch_size
 
     return {key: value / max(1, count) for key, value in totals.items()}
@@ -1172,8 +1079,6 @@ def export_prediction_excel(
             "complex_nmse",
             "target_min_db",
             "pred_min_db",
-            "target_notch_ghz",
-            "pred_notch_ghz",
             *bit_headers,
             *true_headers,
             *pred_headers,
@@ -1223,8 +1128,6 @@ def export_prediction_excel(
                         float(sample_complex_nmse_np[sample_offset]),
                         float(target_min_db_np[sample_offset]),
                         float(pred_min_db_np[sample_offset]),
-                        float(freq_axis_ghz[int(target_min_idx_np[sample_offset])]),
-                        float(freq_axis_ghz[int(pred_min_idx_np[sample_offset])]),
                         *xb_np[sample_offset].astype(np.int32).tolist(),
                         *target_db_np[sample_offset].tolist(),
                         *pred_db_np[sample_offset].tolist(),
@@ -1269,15 +1172,9 @@ def train_model(cfg: Config) -> tuple[dict[str, float], list[dict[str, float]]]:
                 "train_total",
                 "train_complex_mse",
                 "train_db_mae",
-                "train_notch",
-                "train_passive",
-                "train_smooth",
                 "val_total",
                 "val_complex_mse",
                 "val_db_mae",
-                "val_notch",
-                "val_passive",
-                "val_smooth",
                 "lr",
             ]
         )
@@ -1288,9 +1185,6 @@ def train_model(cfg: Config) -> tuple[dict[str, float], list[dict[str, float]]]:
             "total": 0.0,
             "complex_mse": 0.0,
             "db_mae": 0.0,
-            "notch": 0.0,
-            "passive": 0.0,
-            "smooth": 0.0,
         }
         count = 0
         for batch_idx, (xb, yb) in enumerate(train_loader, start=1):
@@ -1302,7 +1196,7 @@ def train_model(cfg: Config) -> tuple[dict[str, float], list[dict[str, float]]]:
             optimizer.zero_grad(set_to_none=True)
             with autocast_context(device, cfg.use_amp):
                 outputs = model(xb, freq_axis_hz)
-                losses = physics_informed_loss(outputs, yb, freq_axis_hz, cfg, epoch)
+                losses = reconstruction_loss(outputs, yb, freq_axis_hz, cfg, epoch)
 
             if not torch.isfinite(losses.total):
                 scheduler.step()
@@ -1325,9 +1219,6 @@ def train_model(cfg: Config) -> tuple[dict[str, float], list[dict[str, float]]]:
             train_totals["total"] += losses.total.item() * batch_size
             train_totals["complex_mse"] += losses.complex_mse.item() * batch_size
             train_totals["db_mae"] += losses.db_mae.item() * batch_size
-            train_totals["notch"] += losses.notch.item() * batch_size
-            train_totals["passive"] += losses.passive.item() * batch_size
-            train_totals["smooth"] += losses.smooth.item() * batch_size
             count += batch_size
 
             if cfg.log_every_batches > 0 and batch_idx % cfg.log_every_batches == 0:
@@ -1350,15 +1241,9 @@ def train_model(cfg: Config) -> tuple[dict[str, float], list[dict[str, float]]]:
             "train_total": train_metrics["total"],
             "train_complex_mse": train_metrics["complex_mse"],
             "train_db_mae": train_metrics["db_mae"],
-            "train_notch": train_metrics["notch"],
-            "train_passive": train_metrics["passive"],
-            "train_smooth": train_metrics["smooth"],
             "val_total": val_metrics["total"],
             "val_complex_mse": val_metrics["complex_mse"],
             "val_db_mae": val_metrics["db_mae"],
-            "val_notch": val_metrics["notch"],
-            "val_passive": val_metrics["passive"],
-            "val_smooth": val_metrics["smooth"],
             "lr": current_lr,
         }
         history_rows.append(row)
@@ -1371,15 +1256,9 @@ def train_model(cfg: Config) -> tuple[dict[str, float], list[dict[str, float]]]:
                     row["train_total"],
                     row["train_complex_mse"],
                     row["train_db_mae"],
-                    row["train_notch"],
-                    row["train_passive"],
-                    row["train_smooth"],
                     row["val_total"],
                     row["val_complex_mse"],
                     row["val_db_mae"],
-                    row["val_notch"],
-                    row["val_passive"],
-                    row["val_smooth"],
                     current_lr,
                 ]
             )
@@ -1425,9 +1304,6 @@ def train_model(cfg: Config) -> tuple[dict[str, float], list[dict[str, float]]]:
         "test_total": test_metrics["total"],
         "test_complex_mse": test_metrics["complex_mse"],
         "test_db_mae": test_metrics["db_mae"],
-        "test_notch": test_metrics["notch"],
-        "test_passive": test_metrics["passive"],
-        "test_smooth": test_metrics["smooth"],
         "layout": dataset.layout.name,
         "seq_len": dataset.seq_len,
         "prediction_graphical_dir": str(graphical_dir),
@@ -1468,7 +1344,7 @@ def run_saved_evaluation(cfg: Config, split: str) -> dict[str, float]:
 
 def parse_args() -> Config:
     cfg = Config()
-    parser = argparse.ArgumentParser(description="Train full R5 physics-informed surrogate.")
+    parser = argparse.ArgumentParser(description="Train the R5O architecture-only surrogate.")
     parser.add_argument("--csv-path", type=Path, default=cfg.csv_path)
     parser.add_argument(
         "--output-mode",
