@@ -6,12 +6,14 @@ Usage:
   python3 Model/main.py --model lgbm [LightGBM args...]
   python3 Model/main.py --usepinn [train] [PINN args...]
   python3 Model/main.py --model pinn [train] [PINN args...]
+  python3 Model/main.py --model r6p [train] [R6P args...]
 
 The script forwards the remaining arguments to the selected backend:
 - `Model/R5O.py` for the default non-PINN path
 - `Model/R5.5B-s.py` for the notebook-style non-PINN baseline
 - `Model/patch_antenna_ai_colab_GPT_R4_LightGBM_with_validation_excel.py` for LightGBM
 - `Model/Pinn/R5PINN_perF.py` for the PINN path
+- `Model/Pinn/R6P_pole_residue.py` for pole-residue structured PINN path
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ BACKEND_SCRIPTS = {
     "r55bs": REPO_ROOT / "Model" / "R5.5B-s.py",
     "lgbm": REPO_ROOT / "Model" / "patch_antenna_ai_colab_GPT_R4_LightGBM_with_validation_excel.py",
     "pinn": REPO_ROOT / "Model" / "Pinn" / "R5PINN_perF.py",
+    "r6p": REPO_ROOT / "Model" / "Pinn" / "R6P_pole_residue.py",
 }
 PINN_COMMANDS = {"train", "inspect", "preprocess"}
 
@@ -38,7 +41,7 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     )
     parser.add_argument(
         "--model",
-        choices=["r5o", "r55bs", "lgbm", "pinn"],
+        choices=["r5o", "r55bs", "lgbm", "pinn", "r6p"],
         default="r5o",
         help="Select which training backend to launch.",
     )
@@ -53,7 +56,7 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
 def build_command(model_name: str, forwarded: list[str]) -> list[str]:
     script = BACKEND_SCRIPTS[model_name]
     cmd = [sys.executable, str(script)]
-    if model_name == "pinn":
+    if model_name in {"pinn", "r6p"}:
         if forwarded and forwarded[0] in PINN_COMMANDS:
             cmd.extend(forwarded)
         else:
