@@ -1,7 +1,7 @@
 {
-  "geometry_catalog_path": "/Users/zhuowenfeng6626/Downloads/ProjectAntennaPatch/mainPAP/Data/NotprocessedData/60000 Patch Antenna File/patch_antennas_updated5b.csv",
-  "curves_root": "/Users/zhuowenfeng6626/Downloads/ProjectAntennaPatch/mainPAP/Data/NotprocessedData",
-  "processed_csv_path": "/Users/zhuowenfeng6626/Downloads/ProjectAntennaPatch/mainPAP/Data/processed/Full_60000Data_61dB.csv",
+  "geometry_catalog_path": "Data/NotprocessedData/60000 Patch Antenna File/patch_antennas_updated5b.csv",
+  "curves_root": "Data/NotprocessedData",
+  "processed_csv_path": "Data/processed/Full_60000Data_61dB.csv",
   "num_geometries": 60000,
   "num_curve_files": 60000,
   "num_curve_files_discovered": 60000,

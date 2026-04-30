@@ -47,7 +47,8 @@ The current default processed files are:
 | R5O | `Model/R5O.py` | Processed CSV to full curve | GATv2-style graph encoder plus geometry-conditioned decoder trained as the non-PINN architecture baseline |
 | R5.5B-s | `Model/R5.5B-s.py` | Processed CSV to full curve | Older notebook-style GraphConv plus spectral and Transformer decoder baseline |
 | R5 PINN | `Model/Pinn/R5PINN_perF.py` | Processed CSV to one dB value at one frequency | Per-frequency graph model with soft physics constraints |
-| R6P Pole-Residue PINN | `Model/Pinn/R6P_pole_residue.py` | Processed CSV to full curve | Shared encoder + pole-residue rational decoder + notch branch + auxiliary transmission-line regularization |
+| R6P Pole-Residue PINN | `Model/Pinn/R6P.py` | Processed CSV to full curve | Shared encoder + pole-residue rational decoder + notch branch + auxiliary transmission-line regularization |
+| R6O Multi-Task Notch | `Model/Pinn/R6O.py` | Processed CSV to full curve + notch features | Shared encoder with two heads: curve reconstruction MAE + notch feature regression loss |
 | LightGBM baseline | `Model/patch_antenna_ai_colab_GPT_R4_LightGBM_with_validation_excel.ipynb` | Processed CSV to 61 separate regressors | Fast tabular baseline with Excel export |
 
 ## Environment Setup
@@ -172,6 +173,7 @@ python3 Model/R5.5B-s.py \
 - `--model r55bs`: `R5.5B-s`
 - `--model pinn` or `--usepinn`: `R5PINN_perF`
 - `--model r6p`: `R6P_pole_residue`
+- `--model r6o`: `R6O`
 
 Examples:
 
@@ -181,6 +183,7 @@ python3 Model/main.py --epochs 80
 python3 Model/main.py --model r55bs --epochs 50
 python3 Model/main.py --usepinn --epochs 80 --batch-size 256
 python3 Model/main.py --model r6p --epochs 120 --batch-size 128
+python3 Model/main.py --model r6o --epochs 120 --batch-size 128
 ```
 
 ## What The PINN Includes
