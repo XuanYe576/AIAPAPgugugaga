@@ -53,13 +53,17 @@ def _apply_dataset_profile(model_name: str, forwarded: list[str], profile: str) 
     if profile == "60k":
         if model_name in {"r5o", "r55bs"} and not _has_arg(out, "--csv-path"):
             out.extend(["--csv-path", str(data_dir / "60k61db.csv"), "--output-mode", "mag_only"])
+        if model_name in {"r5o", "r55bs"} and not _has_arg(out, "--target-curve-points"):
+            out.extend(["--target-curve-points", "501"])
         if model_name == "r5o" and not _has_arg(out, "--seq-len"):
-            out.extend(["--seq-len", "61"])
+            out.extend(["--seq-len", "501"])
         if model_name in {"pinn", "r6p", "r6o"}:
             if not _has_arg(out, "--processed-csv-path"):
                 out.extend(["--processed-csv-path", str(data_dir / "60k61db.csv")])
             if not _has_arg(out, "--processed-meta-path"):
                 out.extend(["--processed-meta-path", str(data_dir / "60k61db.meta.json")])
+        if model_name in {"r6p", "r6o"} and not _has_arg(out, "--target-curve-points"):
+            out.extend(["--target-curve-points", "501"])
         if model_name == "r6o":
             if not _has_arg(out, "--train-index-path"):
                 out.extend(["--train-index-path", str(data_dir / "train_60k.txt")])
@@ -86,6 +90,8 @@ def _apply_dataset_profile(model_name: str, forwarded: list[str], profile: str) 
                 out.extend(["--val-index-path", str(data_dir / "val_feedpatch_1093.txt")])
             if not _has_arg(out, "--labels-csv-path"):
                 out.extend(["--labels-csv-path", str(data_dir / "resonance_labels_feedpatch_1093.csv")])
+            if not _has_arg(out, "--use-feed-channel"):
+                out.append("--use-feed-channel")
 
     return out
 

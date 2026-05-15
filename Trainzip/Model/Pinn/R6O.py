@@ -3,11 +3,12 @@ R6O: multi-task notch-oriented model (no physics-induced losses).
 
 Architecture:
 - Shared encoder from geometry (and optional material channel).
-- Branch 1: full-curve S11(dB) reconstruction.
+- Branch 1: fixed high-resolution S11(dB) reconstruction.
 - Branch 2: notch feature regression (notch frequency, notch depth).
 
 Loss:
-- Curve MAE loss.
+- Curve MAE loss. If the dataset target has fewer points than the model output,
+  the model output is linearly resampled to the target length for loss only.
 - Feature loss.
 - Total = curve_loss + feature_weight * feature_loss.
 """
@@ -17,6 +18,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import random
 import sys
 from collections import defaultdict
@@ -66,6 +68,7 @@ from metrics.plotting import load_pyplot
 from utils.adamw import create_optimizer as create_shared_optimizer
 from utils.amp import autocast_context, build_grad_scaler
 from utils.dataP import RAW_DATA_ROOT, preprocess_uploaded_dataset
+from utils.interpolation import maybe_resample_curve_matrix
 
 GRID_HEIGHT = 10
 GRID_WIDTH = 10
@@ -136,6 +139,7 @@ class Config:
     hidden_dim: int = 256
     dropout: float = 0.10
     use_material_channel: bool = False
+    use_feed_channel: bool = False
     use_index_files: bool = True
     use_notch_label_file: bool = True
     er_default: float = 4.4
@@ -153,6 +157,9 @@ class Config:
     eval_split: str = ""
     prediction_plot_count: int = 12
     export_curve_points: int = 501
+    target_curve_points: int = 0
+    output_curve_points: int = 501
+    # Deprecated compatibility args. R6O now uses one 501-point output head.
     curve_head_points: str = ""
     active_curve_points: int = 0
     export_head_points: int = 0
@@ -218,6 +225,19 @@ def _interpolate_curve_1d(curve: torch.Tensor, target_points: int) -> torch.Tens
     return out.view(-1)
 
 
+def _resample_curve_batch(curves: torch.Tensor, target_points: int) -> torch.Tensor:
+    if target_points <= 0 or curves.shape[-1] == target_points:
+        return curves
+    if curves.ndim != 2:
+        raise ValueError("Expected a [batch, points] curve tensor for interpolation.")
+    return F.interpolate(
+        curves.unsqueeze(1),
+        size=target_points,
+        mode="linear",
+        align_corners=True,
+    ).squeeze(1)
+
+
 def _build_export_freq_axis(freq_axis_ghz: torch.Tensor, target_points: int) -> torch.Tensor:
     if target_points <= 0 or freq_axis_ghz.numel() == target_points:
         return freq_axis_ghz
@@ -227,7 +247,13 @@ def _build_export_freq_axis(freq_axis_ghz: torch.Tensor, target_points: int) -> 
 
 
 class ProcessedCurveDataset:
-    def __init__(self, csv_path: Path, meta_path: Path, er_default: float) -> None:
+    def __init__(
+        self,
+        csv_path: Path,
+        meta_path: Path,
+        er_default: float,
+        target_curve_points: int = 0,
+    ) -> None:
         if not csv_path.exists():
             raise FileNotFoundError(f"Processed CSV not found: {csv_path}")
         values = np.loadtxt(csv_path, delimiter=",", dtype=np.float32)
@@ -259,21 +285,57 @@ class ProcessedCurveDataset:
                 f"Processed CSV column count mismatch. Expected {NUM_CELLS + self.seq_len}, found {values.shape[1]}."
             )
 
-        self.geometry = torch.from_numpy((values[:, :NUM_CELLS] > 0.5).astype(np.float32))
-        self.curves_db = torch.from_numpy(values[:, NUM_CELLS:])
+        # Drop rows whose curve targets contain NaN/Inf — they poison MAE
+        # loss and propagate NaN through gradients, corrupting weights for
+        # all subsequent batches.
+        curves_np = values[:, NUM_CELLS:]
+        bad_mask = ~np.isfinite(curves_np).all(axis=1)
+        num_bad = int(bad_mask.sum())
+        if num_bad > 0:
+            print(
+                f"ProcessedCurveDataset: dropping {num_bad} of {curves_np.shape[0]} "
+                f"rows with NaN/Inf curve values from {csv_path.name}."
+            )
+            keep_mask = ~bad_mask
+            values = values[keep_mask]
+            curves_np = curves_np[keep_mask]
+        else:
+            keep_mask = np.ones(curves_np.shape[0], dtype=bool)
+
         freq_axis_ghz = meta.get("freq_axis_ghz", inferred_freq_axis)
         if len(freq_axis_ghz) != self.seq_len:
             freq_axis_ghz = inferred_freq_axis
-        self.freq_axis_ghz = torch.tensor(freq_axis_ghz, dtype=torch.float32)
-        self.antenna_ids = meta.get(
-            "matched_antenna_ids",
-            list(range(1, self.geometry.size(0) + 1)),
+        curves_np, freq_axis_ghz = maybe_resample_curve_matrix(
+            curves_np,
+            np.asarray(freq_axis_ghz, dtype=np.float32),
+            target_curve_points,
         )
+        self.seq_len = int(curves_np.shape[1])
+
+        self.geometry = torch.from_numpy((values[:, :NUM_CELLS] > 0.5).astype(np.float32))
+        self.curves_db = torch.from_numpy(curves_np)
+        self.freq_axis_ghz = torch.tensor(freq_axis_ghz, dtype=torch.float32)
+        raw_ids = meta.get(
+            "matched_antenna_ids",
+            list(range(1, keep_mask.shape[0] + 1)),
+        )
+        if len(raw_ids) == keep_mask.shape[0]:
+            self.antenna_ids = [aid for aid, keep in zip(raw_ids, keep_mask.tolist()) if keep]
+        else:
+            self.antenna_ids = list(range(1, self.geometry.size(0) + 1))
         self.material_map = torch.full(
             (self.geometry.size(0), NUM_CELLS),
             float(er_default),
             dtype=torch.float32,
         )
+        # Binary feed-structure mask: 1 at cells listed in meta feed_cells, 0 elsewhere.
+        # Broadcast across all samples as a fixed indicator channel.
+        feed_cells = meta.get("feed_cells", [])
+        feed_vec = torch.zeros(NUM_CELLS, dtype=torch.float32)
+        for c in feed_cells:
+            if 0 <= c < NUM_CELLS:
+                feed_vec[c] = 1.0
+        self.feed_mask = feed_vec.unsqueeze(0).expand(self.geometry.size(0), -1)
 
     def __len__(self) -> int:
         return self.geometry.size(0)
@@ -287,11 +349,12 @@ class AntennaCurveDataset(Dataset):
     def __len__(self) -> int:
         return len(self.indices)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int]:
         base_idx = self.indices[idx]
         return (
             self.base.geometry[base_idx],
             self.base.material_map[base_idx],
+            self.base.feed_mask[base_idx],
             self.base.curves_db[base_idx],
             base_idx,
         )
@@ -394,7 +457,16 @@ def load_compatible_model_weights(
     skipped: list[str] = []
     for key, value in source_state.items():
         target_key = key
-        if key.startswith("curve_head."):
+        if key.startswith("curve_heads."):
+            # Backward compatibility for the removed multi-head variant:
+            # only import the head that matches the fixed output resolution.
+            parts = key.split(".", 2)
+            if len(parts) == 3 and parts[1] == str(getattr(model, "output_curve_points", "")):
+                target_key = f"curve_head.{parts[2]}"
+            else:
+                skipped.append(key)
+                continue
+        elif key.startswith("curve_head."):
             # Backward compatibility for older single-head checkpoints.
             suffix = key.removeprefix("curve_head.")
             candidates = [candidate for candidate in target_state if candidate.endswith(f".{suffix}")]
@@ -541,6 +613,8 @@ def build_label_feature_targets(
                     depth_db = float(row["depth_db"])
                 except (KeyError, ValueError):
                     continue
+                if not (math.isfinite(notch_freq_ghz) and math.isfinite(depth_db)):
+                    continue
                 if antenna_id not in antenna_id_to_row:
                     continue
                 row_idx = antenna_id_to_row[antenna_id]
@@ -584,23 +658,12 @@ def build_dataloaders(
     return train_loader, val_loader, test_loader, train_idx, val_idx, test_idx
 
 
-def parse_curve_head_points(cfg: Config, native_seq_len: int) -> list[int]:
-    points = {int(native_seq_len)}
-    for raw in cfg.curve_head_points.split(","):
-        raw = raw.strip()
-        if not raw:
-            continue
-        try:
-            value = int(raw)
-        except ValueError:
-            continue
-        if value > 0:
-            points.add(value)
-    if cfg.active_curve_points > 0:
-        points.add(int(cfg.active_curve_points))
-    if cfg.export_head_points > 0:
-        points.add(int(cfg.export_head_points))
-    return sorted(points)
+def resolve_output_curve_points(cfg: Config, native_seq_len: int) -> int:
+    if cfg.output_curve_points > 0:
+        return int(cfg.output_curve_points)
+    if cfg.export_curve_points > 0:
+        return int(cfg.export_curve_points)
+    return int(native_seq_len)
 
 
 class SharedConvEncoder(nn.Module):
@@ -633,8 +696,8 @@ class R6OMultiTask(nn.Module):
         super().__init__()
         self.cfg = cfg
         self.seq_len = seq_len
-        self.active_curve_points = int(cfg.active_curve_points or seq_len)
-        in_channels = 2 if cfg.use_material_channel else 1
+        self.output_curve_points = resolve_output_curve_points(cfg, seq_len)
+        in_channels = 1 + int(cfg.use_material_channel) + int(cfg.use_feed_channel)
         hidden = cfg.hidden_dim
 
         self.encoder = SharedConvEncoder(
@@ -642,12 +705,7 @@ class R6OMultiTask(nn.Module):
             encoder_dim=cfg.encoder_dim,
             dropout=cfg.dropout,
         )
-        self.curve_heads = nn.ModuleDict(
-            {
-                str(points): self._make_curve_head(hidden, points)
-                for points in parse_curve_head_points(cfg, seq_len)
-            }
-        )
+        self.curve_head = self._make_curve_head(hidden, self.output_curve_points)
         self.feature_head = nn.Sequential(
             nn.Linear(cfg.encoder_dim, hidden // 2),
             nn.GELU(),
@@ -667,33 +725,45 @@ class R6OMultiTask(nn.Module):
         )
 
     def set_active_curve_points(self, output_points: int) -> None:
-        key = str(int(output_points))
-        if key not in self.curve_heads:
-            raise ValueError(f"No curve head for {output_points} points. Available: {sorted(self.curve_heads)}")
-        self.active_curve_points = int(output_points)
+        # Kept only so older launch commands do not crash. The model has one
+        # fixed output head; loss-time resampling handles 61-point targets.
+        if int(output_points) != self.output_curve_points:
+            print(
+                "R6O ignores active curve head changes; "
+                f"using fixed {self.output_curve_points}-point output."
+            )
 
-    def _build_input(self, geom_bits: torch.Tensor, material_map: torch.Tensor) -> torch.Tensor:
+    def _build_input(
+        self,
+        geom_bits: torch.Tensor,
+        material_map: torch.Tensor,
+        feed_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
         geom = geom_bits.view(-1, 1, GRID_HEIGHT, GRID_WIDTH)
+        channels = [geom]
         if self.cfg.use_material_channel:
             er = material_map.view(-1, 1, GRID_HEIGHT, GRID_WIDTH)
             er = (er - self.cfg.er_min) / max(self.cfg.er_max - self.cfg.er_min, 1.0e-6)
-            er = er.clamp(0.0, 1.0)
-            return torch.cat([geom, er], dim=1)
-        return geom
+            channels.append(er.clamp(0.0, 1.0))
+        if self.cfg.use_feed_channel:
+            if feed_mask is not None:
+                fm = feed_mask.view(-1, 1, GRID_HEIGHT, GRID_WIDTH).float()
+            else:
+                fm = torch.zeros_like(geom)
+            channels.append(fm)
+        return torch.cat(channels, dim=1) if len(channels) > 1 else channels[0]
 
     def forward(
         self,
         geom_bits: torch.Tensor,
         material_map: torch.Tensor,
         curve_points: int | None = None,
+        feed_mask: torch.Tensor | None = None,
     ) -> EvalOutputs:
-        x = self._build_input(geom_bits, material_map)
+        del curve_points
+        x = self._build_input(geom_bits, material_map, feed_mask)
         emb = self.encoder(x)
-        output_points = int(curve_points or self.active_curve_points)
-        key = str(output_points)
-        if key not in self.curve_heads:
-            raise ValueError(f"No curve head for {output_points} points. Available: {sorted(self.curve_heads)}")
-        curve_db = self.curve_heads[key](emb)
+        curve_db = self.curve_head(emb)
         feature_raw = self.feature_head(emb)
         return EvalOutputs(curve_db=curve_db, features=feature_raw)
 
@@ -705,7 +775,8 @@ def compute_losses(
     feature_targets: torch.Tensor | None = None,
     feature_mask: torch.Tensor | None = None,
 ) -> LossBreakdown:
-    curve_mae = torch.abs(outputs.curve_db - target_db).mean()
+    curve_pred_for_loss = _resample_curve_batch(outputs.curve_db, target_db.shape[-1])
+    curve_mae = torch.abs(curve_pred_for_loss - target_db).mean()
     if feature_targets is None:
         feature_loss = curve_mae.new_zeros(())
     else:
@@ -741,9 +812,10 @@ def evaluate_model(
     totals = {"total": 0.0, "curve_mae": 0.0, "feature_loss": 0.0}
     count = 0
     with torch.no_grad():
-        for geom_bits, material_map, target_db, base_idx in loader:
+        for geom_bits, material_map, feed_mask, target_db, base_idx in loader:
             geom_bits = geom_bits.to(device)
             material_map = material_map.to(device)
+            feed_mask = feed_mask.to(device)
             target_db = target_db.to(device)
             if all_feature_targets is not None:
                 batch_feature_targets = all_feature_targets[base_idx].to(device)
@@ -755,7 +827,7 @@ def evaluate_model(
             else:
                 batch_feature_targets = None
                 batch_feature_mask = None
-            outputs = model(geom_bits, material_map)
+            outputs = model(geom_bits, material_map, feed_mask=feed_mask)
             losses = compute_losses(
                 outputs,
                 target_db,
@@ -783,6 +855,7 @@ def save_prediction_graphs(
     export_curve_points: int,
     export_head_points: int = 0,
 ) -> Path:
+    del export_head_points
     output_dir.mkdir(parents=True, exist_ok=True)
     if plot_count <= 0:
         return output_dir
@@ -798,10 +871,10 @@ def save_prediction_graphs(
                 break
             geom = base.geometry[idx].unsqueeze(0).to(device)
             mat = base.material_map[idx].unsqueeze(0).to(device)
+            fm = base.feed_mask[idx].unsqueeze(0).to(device)
             target_tensor = _interpolate_curve_1d(base.curves_db[idx].detach(), export_curve_points)
-            requested_head = export_head_points if export_head_points > 0 else None
             pred_tensor = _interpolate_curve_1d(
-                model(geom, mat, curve_points=requested_head).curve_db.squeeze(0).detach().cpu(),
+                model(geom, mat, feed_mask=fm).curve_db.squeeze(0).detach().cpu(),
                 export_curve_points,
             )
             target = target_tensor.numpy()
@@ -848,6 +921,7 @@ def train_model(cfg: Config) -> dict[str, float]:
         cfg.processed_csv_path,
         cfg.processed_meta_path,
         er_default=cfg.er_default,
+        target_curve_points=cfg.target_curve_points,
     )
     all_feature_targets: torch.Tensor | None = None
     all_feature_mask: torch.Tensor | None = None
@@ -857,8 +931,6 @@ def train_model(cfg: Config) -> dict[str, float]:
     freq_axis_ghz = base.freq_axis_ghz.to(device)
     train_loader, val_loader, test_loader, train_idx, val_idx, test_idx = build_dataloaders(base, cfg, device)
     model = build_model(cfg, device, seq_len=base.seq_len)
-    if cfg.active_curve_points <= 0:
-        model.set_active_curve_points(base.seq_len)
     if cfg.init_checkpoint_path is not None and cfg.init_checkpoint_path.exists():
         load_compatible_model_weights(
             model,
@@ -892,9 +964,10 @@ def train_model(cfg: Config) -> dict[str, float]:
         model.train()
         train_totals = {"total": 0.0, "curve_mae": 0.0, "feature_loss": 0.0}
         count = 0
-        for batch_idx, (geom_bits, material_map, target_db, base_idx) in enumerate(train_loader, start=1):
+        for batch_idx, (geom_bits, material_map, feed_mask, target_db, base_idx) in enumerate(train_loader, start=1):
             geom_bits = geom_bits.to(device)
             material_map = material_map.to(device)
+            feed_mask = feed_mask.to(device)
             target_db = target_db.to(device)
             if all_feature_targets is not None:
                 batch_feature_targets = all_feature_targets[base_idx].to(device)
@@ -909,7 +982,7 @@ def train_model(cfg: Config) -> dict[str, float]:
 
             optimizer.zero_grad(set_to_none=True)
             with autocast_context(device, cfg.use_amp):
-                outputs = model(geom_bits, material_map)
+                outputs = model(geom_bits, material_map, feed_mask=feed_mask)
                 losses = compute_losses(
                     outputs,
                     target_db,
@@ -917,6 +990,12 @@ def train_model(cfg: Config) -> dict[str, float]:
                     feature_targets=batch_feature_targets,
                     feature_mask=batch_feature_mask,
                 )
+
+            # Guard: never backprop a NaN/Inf loss; otherwise a single corrupt
+            # batch permanently poisons every parameter via Adam's running
+            # moment estimates.
+            if not torch.isfinite(losses.total):
+                continue
 
             scaler.scale(losses.total).backward()
             scaler.unscale_(optimizer)
@@ -1026,10 +1105,10 @@ def train_model(cfg: Config) -> dict[str, float]:
         "test_feature_loss": test_metrics["feature_loss"],
         "num_antennas": len(base),
         "seq_len": base.seq_len,
-        "active_curve_points": model.active_curve_points,
-        "curve_head_points": sorted(int(key) for key in model.curve_heads.keys()),
+        "target_curve_points": cfg.target_curve_points,
+        "output_curve_points": model.output_curve_points,
+        "loss_target_points": base.seq_len,
         "export_curve_points": cfg.export_curve_points,
-        "export_head_points": cfg.export_head_points,
         "prediction_graphical_dir": str(graphical_dir),
         "prediction_graph_count": min(cfg.prediction_plot_count, len(test_idx)),
         "loss_plot_path": str(cfg.loss_plot_path),
@@ -1067,6 +1146,7 @@ def run_saved_evaluation(cfg: Config, split: str) -> dict[str, float]:
         cfg.processed_csv_path,
         cfg.processed_meta_path,
         er_default=cfg.er_default,
+        target_curve_points=cfg.target_curve_points,
     )
     all_feature_targets: torch.Tensor | None = None
     all_feature_mask: torch.Tensor | None = None
@@ -1111,6 +1191,7 @@ def inspect_processed_dataset(cfg: Config) -> None:
         cfg.processed_csv_path,
         cfg.processed_meta_path,
         er_default=cfg.er_default,
+        target_curve_points=cfg.target_curve_points,
     )
     print(f"Processed dataset: {cfg.processed_csv_path}")
     print(f"Metadata: {cfg.processed_meta_path}")
@@ -1149,34 +1230,48 @@ def parse_args() -> Config:
     parser.add_argument("--eval-split", choices=["val", "test"])
     parser.add_argument("--prediction-plot-count", type=int, default=cfg.prediction_plot_count)
     parser.add_argument(
+        "--target-curve-points",
+        type=int,
+        default=cfg.target_curve_points,
+        help="Resample loaded target curves to this many points using shape-preserving PCHIP.",
+    )
+    parser.add_argument(
         "--export-curve-points",
         type=int,
         default=cfg.export_curve_points,
         help="Export/plot curve points; native sequence is linearly interpolated when needed.",
     )
     parser.add_argument(
+        "--output-curve-points",
+        type=int,
+        default=cfg.output_curve_points,
+        help="Fixed R6O curve output size. Use 501 for feed-first then 60k training.",
+    )
+    parser.add_argument(
         "--curve-head-points",
         type=str,
         default=cfg.curve_head_points,
-        help="Comma-separated curve head sizes to include, e.g. '501,61'.",
+        help="Deprecated compatibility arg; ignored by the single-head R6O.",
     )
     parser.add_argument(
         "--active-curve-points",
         type=int,
         default=cfg.active_curve_points,
-        help="Curve head size used for training/evaluation loss. Defaults to dataset sequence length.",
+        help="Deprecated compatibility arg; loss resamples the fixed output to target length.",
     )
     parser.add_argument(
         "--export-head-points",
         type=int,
         default=cfg.export_head_points,
-        help="Curve head size used for plotted/inference exports. Defaults to active head.",
+        help="Deprecated compatibility arg; ignored by the single-head R6O.",
     )
     parser.add_argument("--init-checkpoint-path", type=Path, default=cfg.init_checkpoint_path)
     parser.add_argument("--strict-init", action="store_true")
     parser.add_argument("--loss-feature-weight", type=float, default=cfg.loss_feature_weight)
     parser.add_argument("--loss-curve-weight", type=float, default=cfg.loss_curve_weight)
     parser.add_argument("--disable-material-channel", action="store_true")
+    parser.add_argument("--use-feed-channel", action="store_true",
+                        help="Add a fixed binary feed-structure channel from meta feed_cells.")
     parser.add_argument("--disable-index-files", action="store_true")
     parser.add_argument("--disable-notch-label-file", action="store_true")
     parser.add_argument("--er-default", type=float, default=cfg.er_default)
@@ -1202,7 +1297,9 @@ def parse_args() -> Config:
     cfg.log_every_batches = args.log_every_batches
     cfg.eval_split = args.eval_split or ""
     cfg.prediction_plot_count = max(0, args.prediction_plot_count)
+    cfg.target_curve_points = max(0, args.target_curve_points)
     cfg.export_curve_points = max(0, args.export_curve_points)
+    cfg.output_curve_points = max(0, args.output_curve_points)
     cfg.curve_head_points = args.curve_head_points
     cfg.active_curve_points = max(0, args.active_curve_points)
     cfg.export_head_points = max(0, args.export_head_points)
@@ -1211,6 +1308,7 @@ def parse_args() -> Config:
     cfg.loss_feature_weight = max(0.0, args.loss_feature_weight)
     cfg.loss_curve_weight = max(0.0, args.loss_curve_weight)
     cfg.use_material_channel = not args.disable_material_channel
+    cfg.use_feed_channel = args.use_feed_channel
     cfg.use_index_files = not args.disable_index_files
     cfg.use_notch_label_file = not args.disable_notch_label_file
     cfg.er_default = float(np.clip(args.er_default, cfg.er_min, cfg.er_max))

@@ -304,15 +304,23 @@ def main() -> None:
     if seq_len != freq_ghz.size:
         raise ValueError(f"Frequency axis length {freq_ghz.size} != seq_len {seq_len}.")
 
-    geom = (values[:, :NUM_CELLS] > 0.5).astype(np.float32)
-    curves = values[:, NUM_CELLS:]
-    antenna_ids = meta.get("matched_antenna_ids", list(range(1, values.shape[0] + 1)))
-    if len(antenna_ids) != values.shape[0]:
-        antenna_ids = list(range(1, values.shape[0] + 1))
+    geom_all = (values[:, :NUM_CELLS] > 0.5).astype(np.float32)
+    curves_all = values[:, NUM_CELLS:]
+    antenna_ids_all = meta.get("matched_antenna_ids", list(range(1, values.shape[0] + 1)))
+    if len(antenna_ids_all) != values.shape[0]:
+        antenna_ids_all = list(range(1, values.shape[0] + 1))
+
+    # Drop rows with NaN/Inf S11 before building labels and split indices.
+    valid_mask = np.all(np.isfinite(curves_all), axis=1)
+    nan_skipped = int((~valid_mask).sum())
+    valid_orig_indices = np.where(valid_mask)[0]
+    geom = geom_all[valid_orig_indices]
+    curves = curves_all[valid_orig_indices]
+    antenna_ids = [antenna_ids_all[j] for j in valid_orig_indices]
 
     rows: list[LabelRow] = []
     fallback_count = 0
-    for i in range(values.shape[0]):
+    for i in range(len(curves)):
         f_res, depth, prom, conf, method, valid = pick_resonance(
             freq_ghz=freq_ghz,
             s11_db=curves[i],
@@ -327,7 +335,7 @@ def main() -> None:
             fallback_count += 1
         rows.append(
             LabelRow(
-                row_index=i,
+                row_index=int(valid_orig_indices[i]),
                 antenna_id=int(antenna_ids[i]),
                 resonant_freq_ghz=f_res,
                 depth_db=depth,
@@ -350,6 +358,7 @@ def main() -> None:
 
     low_conf = sum(1 for r in rows if r.confidence < 0.35)
     print(f"total_samples={len(rows)}")
+    print(f"nan_skipped={nan_skipped}")
     print(f"train={len(train_idx)} val={len(val_idx)} test={len(test_idx)}")
     print(f"fallback_global_min={fallback_count}")
     print(f"low_confidence(<0.35)={low_conf}")

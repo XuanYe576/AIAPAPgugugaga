@@ -1609,5 +1609,10 @@
     998,
     9
   ],
-  "dataset_name": "FeedPatch_1093Data_501dB"
+  "dataset_name": "FeedPatch_1093Data_501dB",
+  "feed_cells": [
+    94,
+    95
+  ],
+  "feed_cells_note": "Flat indices (0-indexed, stored bottom-to-top convention) of cells that are always conducting due to the feed stub/contact pad (stored_row=9, cols=4,5). Use as a fixed feed-structure channel when training on FeedPatch data."
 }
