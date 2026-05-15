@@ -42,6 +42,7 @@ from metrics.prediction_graphs import (
 )
 from utils.adamw import create_optimizer as create_shared_optimizer
 from utils.amp import autocast_context, build_grad_scaler
+from utils.interpolation import maybe_resample_curve_matrix, uniform_freq_axis
 
 GRID_HEIGHT = 10
 GRID_WIDTH = 10
@@ -113,6 +114,7 @@ class Config:
     graph_k: int = 8
     eval_split: str = ""
     prediction_plot_count: int = 12
+    target_curve_points: int = 0
     output_dir: Path = field(default_factory=_default_output_dir)
     weights_filename: str = "r55bs_best.pt"
     checkpoint_filename: str = "r55bs_best.ckpt"
@@ -160,17 +162,22 @@ def get_device(name: str) -> str:
     return name
 
 
-def infer_layout(column_count: int, requested_mode: str) -> LayoutInfo:
+def infer_layout(column_count: int, requested_mode: str, input_dim: int = NUM_CELLS) -> LayoutInfo:
+    mag_seq_len = column_count - input_dim
+    if mag_seq_len <= 0:
+        raise ValueError(f"Unsupported CSV layout with {column_count} columns.")
     if requested_mode == "auto":
-        if column_count >= SUPPORTED_LAYOUTS["complex_61"].expected_cols:
+        if column_count == SUPPORTED_LAYOUTS["complex_61"].expected_cols:
             return SUPPORTED_LAYOUTS["complex_61"]
-        if column_count >= SUPPORTED_LAYOUTS["mag_only"].expected_cols:
-            return SUPPORTED_LAYOUTS["mag_only"]
+        if column_count > input_dim:
+            return LayoutInfo("mag_only", mag_seq_len, False, column_count)
         raise ValueError(
             f"Unsupported CSV layout with {column_count} columns. "
-            "Expected 222 (100 + 61x2) or 161 (100 + 61)."
+            "Expected complex data or magnitude-only columns after the 100 geometry cells."
         )
 
+    if requested_mode == "mag_only":
+        return LayoutInfo("mag_only", mag_seq_len, False, column_count)
     layout = SUPPORTED_LAYOUTS[requested_mode]
     if column_count < layout.expected_cols:
         raise ValueError(
@@ -188,6 +195,7 @@ class AntennaDataset(Dataset):
         csv_path: Path,
         input_dim: int = NUM_CELLS,
         output_mode: str = "complex_61",
+        target_curve_points: int = 0,
     ) -> None:
         csv_path = Path(csv_path)
         if not csv_path.exists():
@@ -198,13 +206,27 @@ class AntennaDataset(Dataset):
         if values.ndim != 2:
             raise ValueError("CSV must be a 2D tabular array.")
 
-        layout = infer_layout(values.shape[1], output_mode)
+        layout = infer_layout(values.shape[1], output_mode, input_dim=input_dim)
         x = values[:, :input_dim]
         y_real = values[:, input_dim : input_dim + layout.seq_len]
         if layout.is_complex:
             y_imag = values[:, input_dim + layout.seq_len : input_dim + 2 * layout.seq_len]
         else:
             y_imag = np.zeros_like(y_real)
+
+        finite_mask = np.isfinite(y_real).all(axis=1) & np.isfinite(y_imag).all(axis=1)
+        dropped = int((~finite_mask).sum())
+        if dropped:
+            print(f"AntennaDataset: dropping {dropped} rows with NaN/Inf targets from {csv_path.name}.")
+            x = x[finite_mask]
+            y_real = y_real[finite_mask]
+            y_imag = y_imag[finite_mask]
+
+        if target_curve_points > 0 and target_curve_points != layout.seq_len:
+            old_axis = uniform_freq_axis(1.0, 6.0, layout.seq_len)
+            y_real, _new_axis = maybe_resample_curve_matrix(y_real, old_axis, target_curve_points)
+            y_imag, _new_axis = maybe_resample_curve_matrix(y_imag, old_axis, target_curve_points)
+            layout = LayoutInfo(layout.name, int(target_curve_points), layout.is_complex, input_dim + int(target_curve_points) * (2 if layout.is_complex else 1))
 
         self.csv_path = csv_path
         self.input_dim = input_dim
@@ -652,7 +674,12 @@ def train_model(cfg: Config) -> tuple[dict[str, float], list[dict[str, float]]]:
     save_config(cfg)
 
     device = get_device(cfg.device)
-    dataset = AntennaDataset(cfg.csv_path, input_dim=cfg.input_dim, output_mode=cfg.output_mode)
+    dataset = AntennaDataset(
+        cfg.csv_path,
+        input_dim=cfg.input_dim,
+        output_mode=cfg.output_mode,
+        target_curve_points=cfg.target_curve_points,
+    )
     sync_config_from_dataset(cfg, dataset)
     train_loader, val_loader, test_loader = build_dataloaders(dataset, cfg, device)
     model = build_model(cfg, device)
@@ -777,6 +804,7 @@ def train_model(cfg: Config) -> tuple[dict[str, float], list[dict[str, float]]]:
         "test_complex_mse": test_metrics["complex_mse"],
         "layout": dataset.layout.name,
         "seq_len": dataset.seq_len,
+        "target_curve_points": cfg.target_curve_points,
         "prediction_graphical_dir": str(graphical_dir),
         "prediction_graph_count": min(cfg.prediction_plot_count, len(test_loader.dataset)),
     }
@@ -786,7 +814,12 @@ def train_model(cfg: Config) -> tuple[dict[str, float], list[dict[str, float]]]:
 
 def run_saved_evaluation(cfg: Config, split: str) -> dict[str, float]:
     device = get_device(cfg.device)
-    dataset = AntennaDataset(cfg.csv_path, input_dim=cfg.input_dim, output_mode=cfg.output_mode)
+    dataset = AntennaDataset(
+        cfg.csv_path,
+        input_dim=cfg.input_dim,
+        output_mode=cfg.output_mode,
+        target_curve_points=cfg.target_curve_points,
+    )
     sync_config_from_dataset(cfg, dataset)
     train_loader, val_loader, test_loader = build_dataloaders(dataset, cfg, device)
     loader = val_loader if split == "val" else test_loader
@@ -836,6 +869,7 @@ def parse_args() -> Config:
     parser.add_argument("--log-every-batches", type=int, default=cfg.log_every_batches)
     parser.add_argument("--eval-split", choices=["val", "test"])
     parser.add_argument("--prediction-plot-count", type=int, default=cfg.prediction_plot_count)
+    parser.add_argument("--target-curve-points", type=int, default=cfg.target_curve_points)
     args = parser.parse_args()
 
     cfg.csv_path = args.csv_path
@@ -852,6 +886,7 @@ def parse_args() -> Config:
     cfg.log_every_batches = args.log_every_batches
     cfg.eval_split = args.eval_split or ""
     cfg.prediction_plot_count = max(0, args.prediction_plot_count)
+    cfg.target_curve_points = max(0, args.target_curve_points)
     return cfg
 
 
@@ -870,7 +905,12 @@ def main() -> None:
     for key, value in asdict(cfg).items():
         print(f"  {key}: {value}")
 
-    dataset = AntennaDataset(cfg.csv_path, input_dim=cfg.input_dim, output_mode=cfg.output_mode)
+    dataset = AntennaDataset(
+        cfg.csv_path,
+        input_dim=cfg.input_dim,
+        output_mode=cfg.output_mode,
+        target_curve_points=cfg.target_curve_points,
+    )
     sync_config_from_dataset(cfg, dataset)
 
     inspect_dataset(dataset)
