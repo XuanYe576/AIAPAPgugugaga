@@ -71,6 +71,9 @@ def _apply_dataset_profile(model_name: str, forwarded: list[str], profile: str) 
                 out.extend(["--val-index-path", str(data_dir / "val_60k.txt")])
             if not _has_arg(out, "--labels-csv-path"):
                 out.extend(["--labels-csv-path", str(data_dir / "resonance_labels_60k.csv")])
+        if model_name == "r6p":
+            if not _has_arg(out, "--labels-csv-path"):
+                out.extend(["--labels-csv-path", str(data_dir / "resonance_labels_60k.csv")])
 
     if profile == "feed1093":
         if model_name in {"r5o", "r55bs"} and not _has_arg(out, "--csv-path"):
@@ -92,6 +95,9 @@ def _apply_dataset_profile(model_name: str, forwarded: list[str], profile: str) 
                 out.extend(["--labels-csv-path", str(data_dir / "resonance_labels_feedpatch_1093.csv")])
             if not _has_arg(out, "--use-feed-channel"):
                 out.append("--use-feed-channel")
+        if model_name == "r6p":
+            if not _has_arg(out, "--labels-csv-path"):
+                out.extend(["--labels-csv-path", str(data_dir / "resonance_labels_feedpatch_1093.csv")])
 
     return out
 

@@ -101,6 +101,10 @@ def _default_processed_meta() -> Path:
     return _default_processed_dir() / "Full_60000Data_61dB.meta.json"
 
 
+def _default_labels_csv_path() -> Path:
+    return _default_processed_dir() / "resonance_labels.csv"
+
+
 def _default_results_dir() -> Path:
     return REPO_ROOT / "results" / "R6P_pole_residue"
 
@@ -132,12 +136,17 @@ class Config:
     er_max: float = 12.0
     freq_hz_min: float = 1.0e9
     freq_hz_max: float = 6.0e9
+    labels_csv_path: Path = field(default_factory=_default_labels_csv_path)
+    use_notch_label_file: bool = True
+    label_min_confidence: float = 0.0
+    use_label_fallbacks: bool = True
     loss_data: float = 1.0
     loss_passive: float = 0.25
-    loss_pole_prior: float = 0.0
+    loss_pole_prior: float = 0.10
     loss_beta: float = 0.10
     loss_field: float = 0.02
     loss_notch: float = 0.05
+    loss_notch_label: float = 2.0
     phys_mode_count: int = 2
     pole_damping_ratio: float = 0.03
     notch_sigma_db: float = 4.0
@@ -200,6 +209,7 @@ class LossBreakdown:
     beta: torch.Tensor
     field: torch.Tensor
     notch: torch.Tensor
+    notch_label: torch.Tensor
 
 
 @dataclass(frozen=True)
@@ -783,6 +793,47 @@ def _field_helmholtz_loss(field_map: torch.Tensor, beta_pred: torch.Tensor) -> t
     return residual.pow(2).mean()
 
 
+def build_label_feature_targets(
+    base: "ProcessedCurveDataset",
+    labels_csv_path: Path,
+    min_confidence: float = 0.0,
+    use_fallbacks: bool = True,
+) -> tuple["torch.Tensor", "torch.Tensor"]:
+    """Return (targets, weights): targets are normalized [0,1] resonant freq; weights = confidence."""
+    freq_axis = base.freq_axis_ghz
+    freq_span = max(float((freq_axis[-1] - freq_axis[0]).item()), 1.0e-6)
+    targets = torch.zeros((len(base), 1), dtype=torch.float32)
+    weights = torch.zeros((len(base),), dtype=torch.float32)
+    antenna_id_to_row = {int(aid): row for row, aid in enumerate(base.antenna_ids)}
+    if labels_csv_path.exists():
+        with labels_csv_path.open("r", encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                try:
+                    antenna_id = int(row["antenna_id"])
+                    notch_freq_ghz = float(row["resonant_freq_ghz"])
+                    confidence = float(row.get("confidence", "1.0") or 1.0)
+                except (KeyError, ValueError):
+                    continue
+                if not (math.isfinite(notch_freq_ghz) and math.isfinite(confidence)):
+                    continue
+                valid_token = str(row.get("is_valid_local_min", "1")).strip().lower()
+                is_valid_local = valid_token in {"1", "true", "yes", "y"}
+                method = str(row.get("method", ""))
+                if not use_fallbacks and (not is_valid_local or method == "global_min_fallback"):
+                    continue
+                if confidence < min_confidence:
+                    continue
+                if antenna_id not in antenna_id_to_row:
+                    continue
+                row_idx = antenna_id_to_row[antenna_id]
+                targets[row_idx, 0] = float(
+                    np.clip((notch_freq_ghz - float(freq_axis[0].item())) / freq_span, 0.0, 1.0)
+                )
+                weights[row_idx] = float(np.clip(confidence, 0.0, 1.0))
+    return targets, weights
+
+
 def _notch_target_stats(
     curves_db: torch.Tensor,
     freq_hz: torch.Tensor,
@@ -801,6 +852,8 @@ def compute_losses(
     sample_weights: torch.Tensor,
     freq_hz: torch.Tensor,
     cfg: Config,
+    label_targets: "torch.Tensor | None" = None,
+    label_weights: "torch.Tensor | None" = None,
 ) -> LossBreakdown:
     data = sample_weights * F.smooth_l1_loss(outputs.gamma_db, target_db, reduction="none")
     data_loss = data.mean()
@@ -849,6 +902,17 @@ def compute_losses(
         notch_pred_d - notch_target_d
     ).mean()
 
+    if label_targets is not None and label_weights is not None and label_weights.sum() > 1e-8:
+        freq_span_t = torch.clamp(freq_hz[-1] - freq_hz[0], min=1.0)
+        notch_pred_norm = (outputs.notch_params[:, 0, 0] - freq_hz[0]) / freq_span_t
+        notch_pred_norm = notch_pred_norm.unsqueeze(-1)
+        w = label_weights.unsqueeze(-1)
+        w_sum = w.sum().clamp(min=1e-8)
+        per_sample = F.smooth_l1_loss(notch_pred_norm, label_targets, reduction="none")
+        notch_label_loss = (w * per_sample).sum() / w_sum
+    else:
+        notch_label_loss = data_loss.new_zeros(())
+
     total = (
         cfg.loss_data * data_loss
         + cfg.loss_passive * passive_loss
@@ -856,6 +920,7 @@ def compute_losses(
         + cfg.loss_beta * beta_loss
         + cfg.loss_field * field_loss
         + cfg.loss_notch * notch_loss
+        + cfg.loss_notch_label * notch_label_loss
     )
     return LossBreakdown(
         total=total,
@@ -865,6 +930,7 @@ def compute_losses(
         beta=beta_loss,
         field=field_loss,
         notch=notch_loss,
+        notch_label=notch_label_loss,
     )
 
 
@@ -879,6 +945,8 @@ def evaluate_model(
     cfg: Config,
     device: str,
     freq_hz: torch.Tensor,
+    all_label_targets: "torch.Tensor | None" = None,
+    all_label_weights: "torch.Tensor | None" = None,
 ) -> dict[str, float]:
     model.eval()
     totals = {
@@ -889,18 +957,21 @@ def evaluate_model(
         "beta": 0.0,
         "field": 0.0,
         "notch": 0.0,
+        "notch_label": 0.0,
         "mae_db": 0.0,
     }
     count = 0
     with torch.no_grad():
         for geom_bits, material_map, target_db, base_idx in loader:
-            del base_idx
             geom_bits = geom_bits.to(device)
             material_map = material_map.to(device)
             target_db = target_db.to(device)
             weights = resonance_weights_db(target_db, sigma_db=cfg.notch_sigma_db)
+            batch_label_targets = all_label_targets[base_idx].to(device) if all_label_targets is not None else None
+            batch_label_weights = all_label_weights[base_idx].to(device) if all_label_weights is not None else None
             outputs = model(geom_bits, material_map, freq_hz)
-            losses = compute_losses(outputs, geom_bits, material_map, target_db, weights, freq_hz, cfg)
+            losses = compute_losses(outputs, geom_bits, material_map, target_db, weights, freq_hz, cfg,
+                                    label_targets=batch_label_targets, label_weights=batch_label_weights)
             batch = geom_bits.size(0)
             totals["total"] += losses.total.item() * batch
             totals["data"] += losses.data.item() * batch
@@ -909,6 +980,7 @@ def evaluate_model(
             totals["beta"] += losses.beta.item() * batch
             totals["field"] += losses.field.item() * batch
             totals["notch"] += losses.notch.item() * batch
+            totals["notch_label"] += losses.notch_label.item() * batch
             totals["mae_db"] += torch.abs(outputs.gamma_db - target_db).mean().item() * batch
             count += batch
     return {key: value / max(1, count) for key, value in totals.items()}
@@ -990,6 +1062,17 @@ def train_model(cfg: Config) -> dict[str, float]:
         target_curve_points=cfg.target_curve_points,
     )
     freq_hz = base.freq_axis_hz.to(device)
+    all_label_targets: torch.Tensor | None = None
+    all_label_weights: torch.Tensor | None = None
+    if cfg.use_notch_label_file:
+        all_label_targets, all_label_weights = build_label_feature_targets(
+            base,
+            cfg.labels_csv_path,
+            min_confidence=cfg.label_min_confidence,
+            use_fallbacks=cfg.use_label_fallbacks,
+        )
+        n_labeled = int((all_label_weights > 0).sum().item())
+        print(f"Notch labels loaded: {n_labeled}/{len(base)} samples with confidence > 0")
     train_loader, val_loader, test_loader, train_idx, val_idx, test_idx = build_dataloaders(base, cfg, device)
     model = build_model(cfg, device)
     if cfg.init_checkpoint_path is not None and cfg.init_checkpoint_path.exists():
@@ -1019,6 +1102,7 @@ def train_model(cfg: Config) -> dict[str, float]:
                 "train_beta",
                 "train_field",
                 "train_notch",
+                "train_notch_label",
                 "val_total",
                 "val_data",
                 "val_passive",
@@ -1026,6 +1110,7 @@ def train_model(cfg: Config) -> dict[str, float]:
                 "val_beta",
                 "val_field",
                 "val_notch",
+                "val_notch_label",
                 "val_mae_db",
             ]
         )
@@ -1040,15 +1125,17 @@ def train_model(cfg: Config) -> dict[str, float]:
             "beta": 0.0,
             "field": 0.0,
             "notch": 0.0,
+            "notch_label": 0.0,
         }
         count = 0
 
         for batch_idx, (geom_bits, material_map, target_db, base_idx) in enumerate(train_loader, start=1):
-            del base_idx
             geom_bits = geom_bits.to(device)
             material_map = material_map.to(device)
             target_db = target_db.to(device)
             sample_weights = resonance_weights_db(target_db, sigma_db=cfg.notch_sigma_db)
+            batch_label_targets = all_label_targets[base_idx].to(device) if all_label_targets is not None else None
+            batch_label_weights = all_label_weights[base_idx].to(device) if all_label_weights is not None else None
 
             optimizer.zero_grad(set_to_none=True)
             with autocast_context(device, cfg.use_amp):
@@ -1061,6 +1148,8 @@ def train_model(cfg: Config) -> dict[str, float]:
                     sample_weights=sample_weights,
                     freq_hz=freq_hz,
                     cfg=cfg,
+                    label_targets=batch_label_targets,
+                    label_weights=batch_label_weights,
                 )
 
             # Guard: skip backprop on NaN/Inf so a single corrupt batch does
@@ -1082,6 +1171,7 @@ def train_model(cfg: Config) -> dict[str, float]:
             train_totals["beta"] += losses.beta.item() * batch
             train_totals["field"] += losses.field.item() * batch
             train_totals["notch"] += losses.notch.item() * batch
+            train_totals["notch_label"] += losses.notch_label.item() * batch
             count += batch
 
             if cfg.log_every_batches > 0 and batch_idx % cfg.log_every_batches == 0:
@@ -1097,7 +1187,8 @@ def train_model(cfg: Config) -> dict[str, float]:
                 )
 
         train_metrics = {key: value / max(1, count) for key, value in train_totals.items()}
-        val_metrics = evaluate_model(model, val_loader, cfg, device, freq_hz)
+        val_metrics = evaluate_model(model, val_loader, cfg, device, freq_hz,
+                                     all_label_targets=all_label_targets, all_label_weights=all_label_weights)
         row = {
             "epoch": epoch,
             "train_total": train_metrics["total"],
@@ -1107,6 +1198,7 @@ def train_model(cfg: Config) -> dict[str, float]:
             "train_beta": train_metrics["beta"],
             "train_field": train_metrics["field"],
             "train_notch": train_metrics["notch"],
+            "train_notch_label": train_metrics["notch_label"],
             "val_total": val_metrics["total"],
             "val_data": val_metrics["data"],
             "val_passive": val_metrics["passive"],
@@ -1114,6 +1206,7 @@ def train_model(cfg: Config) -> dict[str, float]:
             "val_beta": val_metrics["beta"],
             "val_field": val_metrics["field"],
             "val_notch": val_metrics["notch"],
+            "val_notch_label": val_metrics["notch_label"],
             "val_mae_db": val_metrics["mae_db"],
         }
         history_rows.append(row)
@@ -1129,6 +1222,7 @@ def train_model(cfg: Config) -> dict[str, float]:
                     row["train_beta"],
                     row["train_field"],
                     row["train_notch"],
+                    row["train_notch_label"],
                     row["val_total"],
                     row["val_data"],
                     row["val_passive"],
@@ -1136,6 +1230,7 @@ def train_model(cfg: Config) -> dict[str, float]:
                     row["val_beta"],
                     row["val_field"],
                     row["val_notch"],
+                    row["val_notch_label"],
                     row["val_mae_db"],
                 ]
             )
@@ -1145,7 +1240,8 @@ def train_model(cfg: Config) -> dict[str, float]:
             f"{epoch:03d} | "
             f"train {row['train_total']:.6f} | "
             f"val {row['val_total']:.6f} | "
-            f"mae_db {row['val_mae_db']:.6f}"
+            f"mae_db {row['val_mae_db']:.6f} | "
+            f"notch_lbl {row['val_notch_label']:.6f}"
         )
 
         if row["val_total"] < best_val - 1.0e-6:
@@ -1162,7 +1258,8 @@ def train_model(cfg: Config) -> dict[str, float]:
 
     best_model = build_model(cfg, device)
     load_model_weights(best_model, cfg.checkpoint_path, device)
-    test_metrics = evaluate_model(best_model, test_loader, cfg, device, freq_hz)
+    test_metrics = evaluate_model(best_model, test_loader, cfg, device, freq_hz,
+                                  all_label_targets=all_label_targets, all_label_weights=all_label_weights)
     graphical_dir = save_prediction_graphs(
         model=best_model,
         base=base,
@@ -1185,8 +1282,12 @@ def train_model(cfg: Config) -> dict[str, float]:
         "test_beta": test_metrics["beta"],
         "test_field": test_metrics["field"],
         "test_notch": test_metrics["notch"],
+        "test_notch_label": test_metrics["notch_label"],
         "test_mae_db": test_metrics["mae_db"],
         "num_antennas": len(base),
+        "train_labeled_samples": int((all_label_weights[train_idx] > 0).sum().item()) if all_label_weights is not None else 0,
+        "val_labeled_samples": int((all_label_weights[val_idx] > 0).sum().item()) if all_label_weights is not None else 0,
+        "test_labeled_samples": int((all_label_weights[test_idx] > 0).sum().item()) if all_label_weights is not None else 0,
         "seq_len": base.seq_len,
         "target_curve_points": cfg.target_curve_points,
         "export_curve_points": cfg.export_curve_points,
@@ -1313,10 +1414,15 @@ def parse_args() -> Config:
     parser.add_argument("--loss-beta", type=float, default=cfg.loss_beta)
     parser.add_argument("--loss-field", type=float, default=cfg.loss_field)
     parser.add_argument("--loss-notch", type=float, default=cfg.loss_notch)
+    parser.add_argument("--loss-notch-label", type=float, default=cfg.loss_notch_label)
     parser.add_argument("--disable-aux-head", action="store_true")
     parser.add_argument("--disable-material-channel", action="store_true")
     parser.add_argument("--er-default", type=float, default=cfg.er_default)
     parser.add_argument("--overwrite-processed", action="store_true")
+    parser.add_argument("--labels-csv-path", type=Path, default=cfg.labels_csv_path)
+    parser.add_argument("--disable-notch-label-file", action="store_true")
+    parser.add_argument("--label-min-confidence", type=float, default=cfg.label_min_confidence)
+    parser.add_argument("--use-label-fallbacks", action="store_true", default=cfg.use_label_fallbacks)
     args = parser.parse_args()
 
     cfg.command = args.command
@@ -1347,10 +1453,15 @@ def parse_args() -> Config:
     cfg.loss_beta = max(0.0, args.loss_beta)
     cfg.loss_field = max(0.0, args.loss_field)
     cfg.loss_notch = max(0.0, args.loss_notch)
+    cfg.loss_notch_label = max(0.0, args.loss_notch_label)
     cfg.use_aux_head = not args.disable_aux_head
     cfg.use_material_channel = not args.disable_material_channel
     cfg.er_default = float(np.clip(args.er_default, cfg.er_min, cfg.er_max))
     cfg.overwrite_processed = args.overwrite_processed
+    cfg.labels_csv_path = args.labels_csv_path
+    cfg.use_notch_label_file = not args.disable_notch_label_file
+    cfg.label_min_confidence = float(np.clip(args.label_min_confidence, 0.0, 1.0))
+    cfg.use_label_fallbacks = args.use_label_fallbacks
     return cfg
 
 
