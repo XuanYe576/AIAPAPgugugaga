@@ -20,28 +20,31 @@ run_step() {
 }
 
 run_step \
-  "Step 1/4 | R6O feed/notch prior (1093 samples, 501-point head)" \
+  "Step 1/4 | R6O feed/notch prior (1093 samples, fixed 501-point output)" \
   "weights/logs/R6O_stage1_feed501.log" \
   python3 -u main.py \
     --model r6o \
     --dataset-profile feed1093 \
-    --curve-head-points 501,61 \
-    --active-curve-points 501 \
-    --export-head-points 501 \
+    --output-curve-points 501 \
+    --boundary-antenna-id 30002 \
+    --boundary-loss-weight 0.05 \
+    --loss-feature-weight 5.0 \
     --export-curve-points 501 \
     --epochs 120 \
     --device cuda \
     --results-dir weights/R6O_stage1_feed501
 
 run_step \
-  "Step 2/4 | R6O main geometry training (60k samples, 61-point loss, 501-point export)" \
+  "Step 2/4 | R6O main geometry training (60k samples, PCHIP-interpolated 501-point target)" \
   "weights/logs/R6O_stage2_60k_main_final501.log" \
   python3 -u main.py \
     --model r6o \
     --dataset-profile 60k \
-    --curve-head-points 501,61 \
-    --active-curve-points 61 \
-    --export-head-points 501 \
+    --output-curve-points 501 \
+    --target-curve-points 501 \
+    --boundary-antenna-id 30002 \
+    --boundary-loss-weight 0.05 \
+    --loss-feature-weight 5.0 \
     --export-curve-points 501 \
     --init-checkpoint-path weights/R6O_stage1_feed501/r6o_best.ckpt \
     --epochs 120 \
@@ -60,12 +63,13 @@ run_step \
     --results-dir weights/R6P_stage1_feed501
 
 run_step \
-  "Step 4/4 | R6P main geometry training (60k samples, native 61-point loss, 501-point export)" \
+  "Step 4/4 | R6P main geometry training (60k samples, PCHIP-interpolated 501-point target/export)" \
   "weights/logs/R6P_stage2_60k_main_final501.log" \
   python3 -u main.py \
     --model r6p \
     --dataset-profile 60k \
     --init-checkpoint-path weights/R6P_stage1_feed501/r6p_best.ckpt \
+    --target-curve-points 501 \
     --export-curve-points 501 \
     --epochs 120 \
     --device cuda \

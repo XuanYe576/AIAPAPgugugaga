@@ -67,6 +67,7 @@ from metrics.plotting import load_pyplot
 from utils.adamw import create_optimizer as create_shared_optimizer
 from utils.amp import autocast_context, build_grad_scaler
 from utils.dataP import RAW_DATA_ROOT, preprocess_uploaded_dataset
+from utils.interpolation import maybe_resample_curve_matrix
 
 GRID_HEIGHT = 10
 GRID_WIDTH = 10
@@ -132,8 +133,8 @@ class Config:
     freq_hz_min: float = 1.0e9
     freq_hz_max: float = 6.0e9
     loss_data: float = 1.0
-    loss_passive: float = 0.10
-    loss_pole_prior: float = 0.20
+    loss_passive: float = 0.25
+    loss_pole_prior: float = 0.0
     loss_beta: float = 0.10
     loss_field: float = 0.02
     loss_notch: float = 0.05
@@ -150,6 +151,7 @@ class Config:
     eval_split: str = ""
     prediction_plot_count: int = 12
     export_curve_points: int = 501
+    target_curve_points: int = 0
     init_checkpoint_path: Path | None = None
     strict_init: bool = False
     overwrite_processed: bool = False
@@ -230,7 +232,14 @@ def _build_export_freq_axis_hz(freq_hz: torch.Tensor, target_points: int) -> tor
 
 
 class ProcessedCurveDataset:
-    def __init__(self, csv_path: Path, meta_path: Path, sigma_db: float, er_default: float) -> None:
+    def __init__(
+        self,
+        csv_path: Path,
+        meta_path: Path,
+        sigma_db: float,
+        er_default: float,
+        target_curve_points: int = 0,
+    ) -> None:
         if not csv_path.exists():
             raise FileNotFoundError(f"Processed CSV not found: {csv_path}")
         values = np.loadtxt(csv_path, delimiter=",", dtype=np.float32)
@@ -262,17 +271,44 @@ class ProcessedCurveDataset:
                 f"Processed CSV column count mismatch. Expected {NUM_CELLS + self.seq_len}, found {values.shape[1]}."
             )
 
-        self.geometry = torch.from_numpy((values[:, :NUM_CELLS] > 0.5).astype(np.float32))
-        self.curves_db = torch.from_numpy(values[:, NUM_CELLS:])
+        # Drop rows whose curve targets contain NaN/Inf — they poison the
+        # loss and cascade through gradients, corrupting weights.
+        curves_np = values[:, NUM_CELLS:]
+        bad_mask = ~np.isfinite(curves_np).all(axis=1)
+        num_bad = int(bad_mask.sum())
+        if num_bad > 0:
+            print(
+                f"ProcessedCurveDataset: dropping {num_bad} of {curves_np.shape[0]} "
+                f"rows with NaN/Inf curve values from {csv_path.name}."
+            )
+            keep_mask = ~bad_mask
+            values = values[keep_mask]
+            curves_np = curves_np[keep_mask]
+        else:
+            keep_mask = np.ones(curves_np.shape[0], dtype=bool)
+
         freq_axis_ghz = meta.get("freq_axis_ghz", inferred_freq_axis)
         if len(freq_axis_ghz) != self.seq_len:
             freq_axis_ghz = inferred_freq_axis
+        curves_np, freq_axis_ghz = maybe_resample_curve_matrix(
+            curves_np,
+            np.asarray(freq_axis_ghz, dtype=np.float32),
+            target_curve_points,
+        )
+        self.seq_len = int(curves_np.shape[1])
+
+        self.geometry = torch.from_numpy((values[:, :NUM_CELLS] > 0.5).astype(np.float32))
+        self.curves_db = torch.from_numpy(curves_np)
         self.freq_axis_ghz = torch.tensor(freq_axis_ghz, dtype=torch.float32)
         self.freq_axis_hz = self.freq_axis_ghz * 1.0e9
-        self.antenna_ids = meta.get(
+        raw_ids = meta.get(
             "matched_antenna_ids",
-            list(range(1, self.geometry.size(0) + 1)),
+            list(range(1, keep_mask.shape[0] + 1)),
         )
+        if len(raw_ids) == keep_mask.shape[0]:
+            self.antenna_ids = [aid for aid, keep in zip(raw_ids, keep_mask.tolist()) if keep]
+        else:
+            self.antenna_ids = list(range(1, self.geometry.size(0) + 1))
         self.sample_weights = resonance_weights_db(self.curves_db, sigma_db=sigma_db)
 
         self.material_map = torch.full(
@@ -642,12 +678,21 @@ class R6PPoleResidue(nn.Module):
         residue_re = residue_scale * torch.tanh(raw_r_re)
         residue_im = residue_scale * torch.tanh(raw_r_im)
 
+        # Under CUDA autocast (bf16), pole/residue branches can mix fp32/bf16.
+        # torch.complex requires matching real/imag dtypes — promote to fp32 here.
+        pole_real = pole_real.float()
+        pole_imag = pole_imag.float()
+        residue_re = residue_re.float()
+        residue_im = residue_im.float()
+        direct_re32 = torch.tanh(direct_re).float()
+        direct_im32 = torch.tanh(direct_im).float()
+
         poles = torch.complex(pole_real, pole_imag)
         residues = torch.complex(residue_re, residue_im)
-        direct = torch.complex(torch.tanh(direct_re), torch.tanh(direct_im)).squeeze(-1)
-        tau = 2.0e-10 * torch.tanh(raw_tau).squeeze(-1)
+        direct = torch.complex(direct_re32, direct_im32).squeeze(-1)
+        tau = (2.0e-10 * torch.tanh(raw_tau).squeeze(-1)).float()
 
-        omega = 2.0 * math.pi * freq_hz.view(1, 1, -1)
+        omega = (2.0 * math.pi * freq_hz.view(1, 1, -1)).float()
         jw = torch.complex(torch.zeros_like(omega), omega)
         poles_e = poles.unsqueeze(-1)
         residues_e = residues.unsqueeze(-1)
@@ -696,9 +741,13 @@ class R6PPoleResidue(nn.Module):
         packed = self.pole_head(embedding)
         gamma_rational, poles, residues = self._decode_rational(packed, freq_hz)
         notch_gain, notch_params = self._decode_notch_gain(embedding, freq_hz)
-        gamma = gamma_rational * torch.complex(notch_gain, torch.zeros_like(notch_gain))
+        ng = notch_gain.float()
+        gamma = gamma_rational * torch.complex(ng, torch.zeros_like(ng))
         gamma_mag = torch.abs(gamma).clamp_min(EPS)
-        gamma_db = 20.0 * torch.log10(gamma_mag)
+        # S11 magnitude above 1 is non-passive; report/train dB on the physical
+        # side while the passive loss still penalizes the raw complex response.
+        gamma_mag_db = gamma_mag.clamp_max(1.0)
+        gamma_db = 20.0 * torch.log10(gamma_mag_db)
 
         if self.cfg.use_aux_head:
             beta_pred, field_map = self._decode_aux(embedding)
@@ -764,6 +813,8 @@ def compute_losses(
     fr_hz = theoretical_resonant_freq_hz(L_m, eps_eff)
 
     mode_count = max(1, min(cfg.phys_mode_count, cfg.num_poles))
+    freq_start = freq_hz[0]
+    freq_span = torch.clamp(freq_hz[-1] - freq_hz[0], min=1.0)
     pole_imag_hz = outputs.poles.imag / (2.0 * math.pi)
     pole_real_hz = -outputs.poles.real / (2.0 * math.pi)
     sorted_imag, _ = torch.sort(pole_imag_hz, dim=1)
@@ -771,9 +822,14 @@ def compute_losses(
     mode_ids = torch.arange(1, mode_count + 1, device=geom_bits.device, dtype=torch.float32).view(1, -1)
     target_modes_hz = fr_hz.unsqueeze(-1) * mode_ids
     target_damping_hz = cfg.pole_damping_ratio * target_modes_hz
-    pole_prior_loss = F.mse_loss(sorted_imag[:, :mode_count], target_modes_hz) + F.mse_loss(
-        sorted_real[:, :mode_count],
-        target_damping_hz,
+    # Compare pole priors in normalized frequency units. The old raw-Hz MSE
+    # produced ~1e17 losses and drowned the S11 data objective.
+    pole_prior_loss = F.mse_loss(
+        (sorted_imag[:, :mode_count] - freq_start) / freq_span,
+        (target_modes_hz - freq_start) / freq_span,
+    ) + F.mse_loss(
+        sorted_real[:, :mode_count] / freq_span,
+        target_damping_hz / freq_span,
     )
 
     if cfg.use_aux_head:
@@ -931,6 +987,7 @@ def train_model(cfg: Config) -> dict[str, float]:
         cfg.processed_meta_path,
         sigma_db=cfg.notch_sigma_db,
         er_default=cfg.er_default,
+        target_curve_points=cfg.target_curve_points,
     )
     freq_hz = base.freq_axis_hz.to(device)
     train_loader, val_loader, test_loader, train_idx, val_idx, test_idx = build_dataloaders(base, cfg, device)
@@ -1005,6 +1062,11 @@ def train_model(cfg: Config) -> dict[str, float]:
                     freq_hz=freq_hz,
                     cfg=cfg,
                 )
+
+            # Guard: skip backprop on NaN/Inf so a single corrupt batch does
+            # not poison every parameter through Adam's running moments.
+            if not torch.isfinite(losses.total):
+                continue
 
             scaler.scale(losses.total).backward()
             scaler.unscale_(optimizer)
@@ -1126,6 +1188,7 @@ def train_model(cfg: Config) -> dict[str, float]:
         "test_mae_db": test_metrics["mae_db"],
         "num_antennas": len(base),
         "seq_len": base.seq_len,
+        "target_curve_points": cfg.target_curve_points,
         "export_curve_points": cfg.export_curve_points,
         "prediction_graphical_dir": str(graphical_dir),
         "prediction_graph_count": min(cfg.prediction_plot_count, len(test_idx)),
@@ -1162,6 +1225,7 @@ def run_saved_evaluation(cfg: Config, split: str) -> dict[str, float]:
         cfg.processed_meta_path,
         sigma_db=cfg.notch_sigma_db,
         er_default=cfg.er_default,
+        target_curve_points=cfg.target_curve_points,
     )
     freq_hz = base.freq_axis_hz.to(device)
     _train_loader, val_loader, test_loader, _train_idx, val_idx, test_idx = build_dataloaders(base, cfg, device)
@@ -1195,6 +1259,7 @@ def inspect_processed_dataset(cfg: Config) -> None:
         cfg.processed_meta_path,
         sigma_db=cfg.notch_sigma_db,
         er_default=cfg.er_default,
+        target_curve_points=cfg.target_curve_points,
     )
     print(f"Processed dataset: {cfg.processed_csv_path}")
     print(f"Metadata: {cfg.processed_meta_path}")
@@ -1232,10 +1297,18 @@ def parse_args() -> Config:
         default=cfg.export_curve_points,
         help="Export/plot curve points; native sequence is linearly interpolated when needed.",
     )
+    parser.add_argument(
+        "--target-curve-points",
+        type=int,
+        default=cfg.target_curve_points,
+        help="Resample loaded target curves to this many points using shape-preserving PCHIP.",
+    )
     parser.add_argument("--init-checkpoint-path", type=Path, default=cfg.init_checkpoint_path)
     parser.add_argument("--strict-init", action="store_true")
     parser.add_argument("--num-poles", type=int, default=cfg.num_poles)
     parser.add_argument("--num-notches", type=int, default=cfg.num_notches)
+    parser.add_argument("--loss-data", type=float, default=cfg.loss_data)
+    parser.add_argument("--loss-passive", type=float, default=cfg.loss_passive)
     parser.add_argument("--loss-pole-prior", type=float, default=cfg.loss_pole_prior)
     parser.add_argument("--loss-beta", type=float, default=cfg.loss_beta)
     parser.add_argument("--loss-field", type=float, default=cfg.loss_field)
@@ -1263,10 +1336,13 @@ def parse_args() -> Config:
     cfg.eval_split = args.eval_split or ""
     cfg.prediction_plot_count = max(0, args.prediction_plot_count)
     cfg.export_curve_points = max(0, args.export_curve_points)
+    cfg.target_curve_points = max(0, args.target_curve_points)
     cfg.init_checkpoint_path = args.init_checkpoint_path
     cfg.strict_init = args.strict_init
     cfg.num_poles = max(2, args.num_poles)
     cfg.num_notches = max(1, args.num_notches)
+    cfg.loss_data = max(0.0, args.loss_data)
+    cfg.loss_passive = max(0.0, args.loss_passive)
     cfg.loss_pole_prior = max(0.0, args.loss_pole_prior)
     cfg.loss_beta = max(0.0, args.loss_beta)
     cfg.loss_field = max(0.0, args.loss_field)

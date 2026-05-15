@@ -20,6 +20,8 @@ from pathlib import Path
 
 import numpy as np
 
+from interpolation import maybe_resample_curve_matrix
+
 GRID_H = 10
 GRID_W = 10
 NUM_CELLS = GRID_H * GRID_W
@@ -275,6 +277,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--train-ratio", type=float, default=0.70)
     p.add_argument("--val-ratio", type=float, default=0.15)
     p.add_argument("--seed", type=int, default=42)
+    p.add_argument(
+        "--target-curve-points",
+        type=int,
+        default=0,
+        help="Resample S11 curves before label picking, e.g. 501 for 60k->501 labels.",
+    )
     return p.parse_args()
 
 
@@ -317,12 +325,17 @@ def main() -> None:
     geom = geom_all[valid_orig_indices]
     curves = curves_all[valid_orig_indices]
     antenna_ids = [antenna_ids_all[j] for j in valid_orig_indices]
+    curves, label_freq_ghz = maybe_resample_curve_matrix(
+        curves,
+        freq_ghz,
+        int(args.target_curve_points),
+    )
 
     rows: list[LabelRow] = []
     fallback_count = 0
     for i in range(len(curves)):
         f_res, depth, prom, conf, method, valid = pick_resonance(
-            freq_ghz=freq_ghz,
+            freq_ghz=label_freq_ghz,
             s11_db=curves[i],
             depth_threshold_db=args.depth_threshold_db,
             min_prominence_db=args.min_prominence_db,
@@ -359,6 +372,7 @@ def main() -> None:
     low_conf = sum(1 for r in rows if r.confidence < 0.35)
     print(f"total_samples={len(rows)}")
     print(f"nan_skipped={nan_skipped}")
+    print(f"label_curve_points={curves.shape[1]}")
     print(f"train={len(train_idx)} val={len(val_idx)} test={len(test_idx)}")
     print(f"fallback_global_min={fallback_count}")
     print(f"low_confidence(<0.35)={low_conf}")
@@ -369,4 +383,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

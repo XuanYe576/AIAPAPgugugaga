@@ -4,7 +4,7 @@ R6O: multi-task notch-oriented model (no physics-induced losses).
 Architecture:
 - Shared encoder from geometry (and optional material channel).
 - Branch 1: fixed high-resolution S11(dB) reconstruction.
-- Branch 2: notch feature regression (notch frequency, notch depth).
+- Branch 2: resonance-frequency regression.
 
 Loss:
 - Curve MAE loss. If the dataset target has fewer points than the model output,
@@ -142,11 +142,15 @@ class Config:
     use_feed_channel: bool = False
     use_index_files: bool = True
     use_notch_label_file: bool = True
+    label_min_confidence: float = 0.0
+    use_label_fallbacks: bool = True
+    boundary_antenna_id: int = 30002
+    boundary_loss_weight: float = 0.05
     er_default: float = 4.4
     er_min: float = 1.0
     er_max: float = 12.0
     loss_curve_weight: float = 1.0
-    loss_feature_weight: float = 0.25
+    loss_feature_weight: float = 10.0
     patience: int = 18
     gradient_clip: float = 1.0
     log_every_batches: int = 10
@@ -207,12 +211,13 @@ class LossBreakdown:
     total: torch.Tensor
     curve_mae: torch.Tensor
     feature_loss: torch.Tensor
+    feature_mae_norm: torch.Tensor
 
 
 @dataclass(frozen=True)
 class EvalOutputs:
     curve_db: torch.Tensor
-    features: torch.Tensor  # [f_notch_ghz_norm, depth_norm]
+    features: torch.Tensor  # [f_resonance_ghz_norm]
 
 
 def _interpolate_curve_1d(curve: torch.Tensor, target_points: int) -> torch.Tensor:
@@ -236,6 +241,12 @@ def _resample_curve_batch(curves: torch.Tensor, target_points: int) -> torch.Ten
         mode="linear",
         align_corners=True,
     ).squeeze(1)
+
+
+def _nonpositive_db(raw_db: torch.Tensor) -> torch.Tensor:
+    # Smooth min(raw_db, 0). This preserves negative dB values while preventing
+    # non-physical positive S11(dB) predictions.
+    return -F.softplus(-raw_db)
 
 
 def _build_export_freq_axis(freq_axis_ghz: torch.Tensor, target_points: int) -> torch.Tensor:
@@ -595,11 +606,14 @@ def _split_from_index_files(
 def build_label_feature_targets(
     base: ProcessedCurveDataset,
     labels_csv_path: Path,
+    min_confidence: float = 0.0,
+    use_fallbacks: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return (targets, weights) where weights = confidence in [0,1]; 0 means excluded."""
     freq_axis = base.freq_axis_ghz
     freq_span = max(float((freq_axis[-1] - freq_axis[0]).item()), 1.0e-6)
-    targets = torch.zeros((len(base), 2), dtype=torch.float32)
-    mask = torch.zeros((len(base),), dtype=torch.bool)
+    targets = torch.zeros((len(base), 1), dtype=torch.float32)
+    weights = torch.zeros((len(base),), dtype=torch.float32)
 
     antenna_id_to_row = {int(aid): row for row, aid in enumerate(base.antenna_ids)}
     if labels_csv_path.exists():
@@ -609,19 +623,26 @@ def build_label_feature_targets(
                 try:
                     antenna_id = int(row["antenna_id"])
                     notch_freq_ghz = float(row["resonant_freq_ghz"])
-                    # depth_db in label file is negative dB.
-                    depth_db = float(row["depth_db"])
+                    confidence = float(row.get("confidence", "1.0") or 1.0)
                 except (KeyError, ValueError):
                     continue
-                if not (math.isfinite(notch_freq_ghz) and math.isfinite(depth_db)):
+                if not (math.isfinite(notch_freq_ghz) and math.isfinite(confidence)):
+                    continue
+                valid_token = str(row.get("is_valid_local_min", "1")).strip().lower()
+                is_valid_local = valid_token in {"1", "true", "yes", "y"}
+                method = str(row.get("method", ""))
+                if not use_fallbacks and (not is_valid_local or method == "global_min_fallback"):
+                    continue
+                if confidence < min_confidence:
                     continue
                 if antenna_id not in antenna_id_to_row:
                     continue
                 row_idx = antenna_id_to_row[antenna_id]
-                targets[row_idx, 0] = float((notch_freq_ghz - float(freq_axis[0].item())) / freq_span)
-                targets[row_idx, 1] = float(max(0.0, -depth_db) / 30.0)
-                mask[row_idx] = True
-    return targets, mask
+                targets[row_idx, 0] = float(
+                    np.clip((notch_freq_ghz - float(freq_axis[0].item())) / freq_span, 0.0, 1.0)
+                )
+                weights[row_idx] = float(np.clip(confidence, 0.0, 1.0))
+    return targets, weights
 
 
 def build_dataloaders(
@@ -710,7 +731,7 @@ class R6OMultiTask(nn.Module):
             nn.Linear(cfg.encoder_dim, hidden // 2),
             nn.GELU(),
             nn.Dropout(cfg.dropout),
-            nn.Linear(hidden // 2, 2),
+            nn.Linear(hidden // 2, 1),
         )
 
     def _make_curve_head(self, hidden: int, output_points: int) -> nn.Sequential:
@@ -763,8 +784,8 @@ class R6OMultiTask(nn.Module):
         del curve_points
         x = self._build_input(geom_bits, material_map, feed_mask)
         emb = self.encoder(x)
-        curve_db = self.curve_head(emb)
-        feature_raw = self.feature_head(emb)
+        curve_db = _nonpositive_db(self.curve_head(emb))
+        feature_raw = torch.sigmoid(self.feature_head(emb))
         return EvalOutputs(curve_db=curve_db, features=feature_raw)
 
 
@@ -773,26 +794,31 @@ def compute_losses(
     target_db: torch.Tensor,
     cfg: Config,
     feature_targets: torch.Tensor | None = None,
-    feature_mask: torch.Tensor | None = None,
+    feature_weights: torch.Tensor | None = None,
 ) -> LossBreakdown:
     curve_pred_for_loss = _resample_curve_batch(outputs.curve_db, target_db.shape[-1])
     curve_mae = torch.abs(curve_pred_for_loss - target_db).mean()
     if feature_targets is None:
         feature_loss = curve_mae.new_zeros(())
+        feature_mae_norm = curve_mae.new_zeros(())
     else:
-        if feature_mask is None:
-            used_pred = outputs.features
-            used_tgt = feature_targets
-        else:
-            used_pred = outputs.features[feature_mask]
-            used_tgt = feature_targets[feature_mask]
-        if used_pred.numel() == 0:
+        if feature_weights is None or feature_weights.sum() < 1e-8:
             feature_loss = curve_mae.new_zeros(())
+            feature_mae_norm = curve_mae.new_zeros(())
         else:
-            feature_loss = F.smooth_l1_loss(used_pred, used_tgt)
+            w = feature_weights.unsqueeze(-1)  # [B, 1]
+            w_sum = w.sum().clamp(min=1e-8)
+            per_sample = F.smooth_l1_loss(outputs.features, feature_targets, reduction="none")
+            feature_loss = (w * per_sample).sum() / w_sum
+            feature_mae_norm = (feature_weights * (outputs.features - feature_targets).abs().squeeze(-1)).sum() / w_sum
 
     total = cfg.loss_curve_weight * curve_mae + cfg.loss_feature_weight * feature_loss
-    return LossBreakdown(total=total, curve_mae=curve_mae, feature_loss=feature_loss)
+    return LossBreakdown(
+        total=total,
+        curve_mae=curve_mae,
+        feature_loss=feature_loss,
+        feature_mae_norm=feature_mae_norm,
+    )
 
 
 def build_model(cfg: Config, device: str, seq_len: int) -> R6OMultiTask:
@@ -806,10 +832,12 @@ def evaluate_model(
     cfg: Config,
     device: str,
     all_feature_targets: torch.Tensor | None,
-    all_feature_mask: torch.Tensor | None,
+    all_feature_weights: torch.Tensor | None,
 ) -> dict[str, float]:
     model.eval()
-    totals = {"total": 0.0, "curve_mae": 0.0, "feature_loss": 0.0}
+    totals = {"total": 0.0, "curve_mae": 0.0, "feature_loss": 0.0, "feature_mae_norm": 0.0}
+    pred_max_db = float("-inf")
+    pred_min_db = float("inf")
     count = 0
     with torch.no_grad():
         for geom_bits, material_map, feed_mask, target_db, base_idx in loader:
@@ -819,28 +847,118 @@ def evaluate_model(
             target_db = target_db.to(device)
             if all_feature_targets is not None:
                 batch_feature_targets = all_feature_targets[base_idx].to(device)
-                batch_feature_mask = (
-                    all_feature_mask[base_idx].to(device)
-                    if all_feature_mask is not None
+                batch_feature_weights = (
+                    all_feature_weights[base_idx].to(device)
+                    if all_feature_weights is not None
                     else None
                 )
             else:
                 batch_feature_targets = None
-                batch_feature_mask = None
+                batch_feature_weights = None
             outputs = model(geom_bits, material_map, feed_mask=feed_mask)
             losses = compute_losses(
                 outputs,
                 target_db,
                 cfg,
                 feature_targets=batch_feature_targets,
-                feature_mask=batch_feature_mask,
+                feature_weights=batch_feature_weights,
             )
             batch = geom_bits.size(0)
             totals["total"] += losses.total.item() * batch
             totals["curve_mae"] += losses.curve_mae.item() * batch
             totals["feature_loss"] += losses.feature_loss.item() * batch
+            totals["feature_mae_norm"] += losses.feature_mae_norm.item() * batch
+            pred_max_db = max(pred_max_db, float(outputs.curve_db.max().item()))
+            pred_min_db = min(pred_min_db, float(outputs.curve_db.min().item()))
             count += batch
-    return {key: value / max(1, count) for key, value in totals.items()}
+    metrics = {key: value / max(1, count) for key, value in totals.items()}
+    metrics["pred_max_db"] = pred_max_db if count else 0.0
+    metrics["pred_min_db"] = pred_min_db if count else 0.0
+    return metrics
+
+
+def boundary_indices(base: ProcessedCurveDataset, antenna_id: int) -> list[int]:
+    if antenna_id <= 0:
+        return []
+    return [idx for idx, aid in enumerate(base.antenna_ids) if int(aid) == int(antenna_id)]
+
+
+def boundary_anchor_loss(
+    model: R6OMultiTask,
+    base: ProcessedCurveDataset,
+    indices: list[int],
+    cfg: Config,
+    device: str,
+    all_feature_targets: torch.Tensor | None,
+    all_feature_weights: torch.Tensor | None,
+) -> torch.Tensor:
+    if not indices or cfg.boundary_loss_weight <= 0.0:
+        return next(model.parameters()).new_zeros(())
+    idx = indices[0]
+    geom = base.geometry[idx].unsqueeze(0).to(device)
+    mat = base.material_map[idx].unsqueeze(0).to(device)
+    fm = base.feed_mask[idx].unsqueeze(0).to(device)
+    target = base.curves_db[idx].unsqueeze(0).to(device)
+    if all_feature_targets is not None and all_feature_weights is not None:
+        feature_targets = all_feature_targets[idx : idx + 1].to(device)
+        feature_weights = all_feature_weights[idx : idx + 1].to(device)
+    else:
+        feature_targets = None
+        feature_weights = None
+    outputs = model(geom, mat, feed_mask=fm)
+    losses = compute_losses(
+        outputs,
+        target,
+        cfg,
+        feature_targets=feature_targets,
+        feature_weights=feature_weights,
+    )
+    return losses.total
+
+
+def evaluate_boundary_condition(
+    model: R6OMultiTask,
+    base: ProcessedCurveDataset,
+    indices: list[int],
+    cfg: Config,
+    device: str,
+    all_feature_targets: torch.Tensor | None,
+    all_feature_weights: torch.Tensor | None,
+) -> dict[str, float]:
+    if not indices:
+        return {}
+    idx = indices[0]
+    freq_axis = base.freq_axis_ghz
+    freq_start = float(freq_axis[0].item())
+    freq_span = max(float((freq_axis[-1] - freq_axis[0]).item()), 1.0e-6)
+    model.eval()
+    with torch.no_grad():
+        geom = base.geometry[idx].unsqueeze(0).to(device)
+        mat = base.material_map[idx].unsqueeze(0).to(device)
+        fm = base.feed_mask[idx].unsqueeze(0).to(device)
+        target = base.curves_db[idx].unsqueeze(0).to(device)
+        outputs = model(geom, mat, feed_mask=fm)
+        curve_mae = torch.abs(outputs.curve_db - target).mean().item()
+        pred_max_db = outputs.curve_db.max().item()
+        pred_min_db = outputs.curve_db.min().item()
+        target_min_db = target.min().item()
+        pred_feature_norm = float(outputs.features[0, 0].clamp(0.0, 1.0).item())
+        pred_res_ghz = freq_start + pred_feature_norm * freq_span
+        if all_feature_targets is not None and all_feature_weights is not None and bool(all_feature_weights[idx].item()):
+            target_feature_norm = float(all_feature_targets[idx, 0].item())
+        else:
+            target_feature_norm = float(target.argmin(dim=1).item()) / max(target.shape[-1] - 1, 1)
+        target_res_ghz = freq_start + target_feature_norm * freq_span
+    return {
+        "boundary_antenna_id": float(base.antenna_ids[idx]),
+        "boundary_curve_mae": float(curve_mae),
+        "boundary_pred_max_db": float(pred_max_db),
+        "boundary_pred_min_db": float(pred_min_db),
+        "boundary_target_min_db": float(target_min_db),
+        "boundary_pred_resonance_ghz": float(pred_res_ghz),
+        "boundary_target_resonance_ghz": float(target_res_ghz),
+        "boundary_feature_mae_ghz": float(abs(pred_res_ghz - target_res_ghz)),
+    }
 
 
 def save_prediction_graphs(
@@ -924,9 +1042,15 @@ def train_model(cfg: Config) -> dict[str, float]:
         target_curve_points=cfg.target_curve_points,
     )
     all_feature_targets: torch.Tensor | None = None
-    all_feature_mask: torch.Tensor | None = None
+    all_feature_weights: torch.Tensor | None = None
     if cfg.use_notch_label_file:
-        all_feature_targets, all_feature_mask = build_label_feature_targets(base, cfg.labels_csv_path)
+        all_feature_targets, all_feature_weights = build_label_feature_targets(
+            base,
+            cfg.labels_csv_path,
+            min_confidence=cfg.label_min_confidence,
+            use_fallbacks=cfg.use_label_fallbacks,
+        )
+    boundary_idx = boundary_indices(base, cfg.boundary_antenna_id)
 
     freq_axis_ghz = base.freq_axis_ghz.to(device)
     train_loader, val_loader, test_loader, train_idx, val_idx, test_idx = build_dataloaders(base, cfg, device)
@@ -954,15 +1078,24 @@ def train_model(cfg: Config) -> dict[str, float]:
                 "train_total",
                 "train_curve_mae",
                 "train_feature_loss",
+                "train_feature_mae_norm",
+                "train_boundary_loss",
                 "val_total",
                 "val_curve_mae",
                 "val_feature_loss",
+                "val_feature_mae_norm",
             ]
         )
 
     for epoch in range(1, cfg.epochs + 1):
         model.train()
-        train_totals = {"total": 0.0, "curve_mae": 0.0, "feature_loss": 0.0}
+        train_totals = {
+            "total": 0.0,
+            "curve_mae": 0.0,
+            "feature_loss": 0.0,
+            "feature_mae_norm": 0.0,
+            "boundary_loss": 0.0,
+        }
         count = 0
         for batch_idx, (geom_bits, material_map, feed_mask, target_db, base_idx) in enumerate(train_loader, start=1):
             geom_bits = geom_bits.to(device)
@@ -971,14 +1104,14 @@ def train_model(cfg: Config) -> dict[str, float]:
             target_db = target_db.to(device)
             if all_feature_targets is not None:
                 batch_feature_targets = all_feature_targets[base_idx].to(device)
-                batch_feature_mask = (
-                    all_feature_mask[base_idx].to(device)
-                    if all_feature_mask is not None
+                batch_feature_weights = (
+                    all_feature_weights[base_idx].to(device)
+                    if all_feature_weights is not None
                     else None
                 )
             else:
                 batch_feature_targets = None
-                batch_feature_mask = None
+                batch_feature_weights = None
 
             optimizer.zero_grad(set_to_none=True)
             with autocast_context(device, cfg.use_amp):
@@ -988,25 +1121,37 @@ def train_model(cfg: Config) -> dict[str, float]:
                     target_db,
                     cfg,
                     feature_targets=batch_feature_targets,
-                    feature_mask=batch_feature_mask,
+                    feature_weights=batch_feature_weights,
                 )
+                anchor = boundary_anchor_loss(
+                    model,
+                    base,
+                    boundary_idx,
+                    cfg,
+                    device,
+                    all_feature_targets,
+                    all_feature_weights,
+                )
+                total_loss = losses.total + cfg.boundary_loss_weight * anchor
 
             # Guard: never backprop a NaN/Inf loss; otherwise a single corrupt
             # batch permanently poisons every parameter via Adam's running
             # moment estimates.
-            if not torch.isfinite(losses.total):
+            if not torch.isfinite(total_loss):
                 continue
 
-            scaler.scale(losses.total).backward()
+            scaler.scale(total_loss).backward()
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.gradient_clip)
             scaler.step(optimizer)
             scaler.update()
 
             batch = geom_bits.size(0)
-            train_totals["total"] += losses.total.item() * batch
+            train_totals["total"] += total_loss.item() * batch
             train_totals["curve_mae"] += losses.curve_mae.item() * batch
             train_totals["feature_loss"] += losses.feature_loss.item() * batch
+            train_totals["feature_mae_norm"] += losses.feature_mae_norm.item() * batch
+            train_totals["boundary_loss"] += anchor.item() * batch
             count += batch
 
             if cfg.log_every_batches > 0 and batch_idx % cfg.log_every_batches == 0:
@@ -1017,7 +1162,9 @@ def train_model(cfg: Config) -> dict[str, float]:
                     f"batch {batch_idx:04d}/{len(train_loader):04d} | "
                     f"loss {running['total']:.6f} | "
                     f"mae {running['curve_mae']:.6f} | "
-                    f"feat {running['feature_loss']:.6f}"
+                    f"feat {running['feature_loss']:.6f} | "
+                    f"feat_mae {running['feature_mae_norm']:.4f} | "
+                    f"bc {running['boundary_loss']:.6f}"
                 )
 
         train_metrics = {key: value / max(1, count) for key, value in train_totals.items()}
@@ -1027,16 +1174,19 @@ def train_model(cfg: Config) -> dict[str, float]:
             cfg,
             device,
             all_feature_targets=all_feature_targets,
-            all_feature_mask=all_feature_mask,
+            all_feature_weights=all_feature_weights,
         )
         row = {
             "epoch": epoch,
             "train_total": train_metrics["total"],
             "train_curve_mae": train_metrics["curve_mae"],
             "train_feature_loss": train_metrics["feature_loss"],
+            "train_feature_mae_norm": train_metrics["feature_mae_norm"],
+            "train_boundary_loss": train_metrics["boundary_loss"],
             "val_total": val_metrics["total"],
             "val_curve_mae": val_metrics["curve_mae"],
             "val_feature_loss": val_metrics["feature_loss"],
+            "val_feature_mae_norm": val_metrics["feature_mae_norm"],
         }
         history_rows.append(row)
         with cfg.history_path.open("a", newline="", encoding="utf-8") as handle:
@@ -1047,9 +1197,12 @@ def train_model(cfg: Config) -> dict[str, float]:
                     row["train_total"],
                     row["train_curve_mae"],
                     row["train_feature_loss"],
+                    row["train_feature_mae_norm"],
+                    row["train_boundary_loss"],
                     row["val_total"],
                     row["val_curve_mae"],
                     row["val_feature_loss"],
+                    row["val_feature_mae_norm"],
                 ]
             )
 
@@ -1059,7 +1212,9 @@ def train_model(cfg: Config) -> dict[str, float]:
             f"train {row['train_total']:.6f} | "
             f"val {row['val_total']:.6f} | "
             f"mae {row['val_curve_mae']:.6f} | "
-            f"feat {row['val_feature_loss']:.6f}"
+            f"feat {row['val_feature_loss']:.6f} | "
+            f"feat_mae {row['val_feature_mae_norm']:.4f} | "
+            f"bc {row['train_boundary_loss']:.6f}"
         )
 
         if row["val_total"] < best_val - 1.0e-6:
@@ -1082,7 +1237,7 @@ def train_model(cfg: Config) -> dict[str, float]:
         cfg,
         device,
         all_feature_targets=all_feature_targets,
-        all_feature_mask=all_feature_mask,
+        all_feature_weights=all_feature_weights,
     )
     graphical_dir = save_prediction_graphs(
         model=best_model,
@@ -1096,13 +1251,43 @@ def train_model(cfg: Config) -> dict[str, float]:
         export_curve_points=cfg.export_curve_points,
         export_head_points=cfg.export_head_points,
     )
+    boundary_graphical_dir = ""
+    if boundary_idx:
+        boundary_graphical_dir = str(
+            save_prediction_graphs(
+                model=best_model,
+                base=base,
+                indices=boundary_idx,
+                output_dir=cfg.prediction_graphical_dir / "boundary",
+                split="boundary",
+                plot_count=len(boundary_idx),
+                device=device,
+                freq_axis_ghz=freq_axis_ghz,
+                export_curve_points=cfg.export_curve_points,
+                export_head_points=cfg.export_head_points,
+            )
+        )
+    boundary_metrics = evaluate_boundary_condition(
+        best_model,
+        base,
+        boundary_idx,
+        cfg,
+        device,
+        all_feature_targets,
+        all_feature_weights,
+    )
     plot_loss_curve(history_rows, cfg.loss_plot_path, title="R6O Multi-Task Training Curve")
     summary = {
         "best_epoch": best_epoch,
         "best_val_total": best_val,
         "test_total": test_metrics["total"],
         "test_curve_mae": test_metrics["curve_mae"],
+        "test_pred_max_db": test_metrics["pred_max_db"],
+        "test_pred_min_db": test_metrics["pred_min_db"],
         "test_feature_loss": test_metrics["feature_loss"],
+        "test_feature_mae_norm": test_metrics["feature_mae_norm"],
+        "test_feature_mae_ghz": test_metrics["feature_mae_norm"]
+        * max(float((base.freq_axis_ghz[-1] - base.freq_axis_ghz[0]).item()), 1.0e-6),
         "num_antennas": len(base),
         "seq_len": base.seq_len,
         "target_curve_points": cfg.target_curve_points,
@@ -1110,15 +1295,22 @@ def train_model(cfg: Config) -> dict[str, float]:
         "loss_target_points": base.seq_len,
         "export_curve_points": cfg.export_curve_points,
         "prediction_graphical_dir": str(graphical_dir),
+        "boundary_graphical_dir": boundary_graphical_dir,
         "prediction_graph_count": min(cfg.prediction_plot_count, len(test_idx)),
         "loss_plot_path": str(cfg.loss_plot_path),
+        "label_min_confidence": cfg.label_min_confidence,
+        "use_label_fallbacks": cfg.use_label_fallbacks,
+        "boundary_antenna_id": cfg.boundary_antenna_id,
+        "boundary_loss_weight": cfg.boundary_loss_weight,
+        "boundary_found": bool(boundary_idx),
         "train_samples": len(train_idx),
         "val_samples": len(val_idx),
         "test_samples": len(test_idx),
-        "train_labeled_samples": int(all_feature_mask[train_idx].sum().item()) if all_feature_mask is not None else 0,
-        "val_labeled_samples": int(all_feature_mask[val_idx].sum().item()) if all_feature_mask is not None else 0,
-        "test_labeled_samples": int(all_feature_mask[test_idx].sum().item()) if all_feature_mask is not None else 0,
+        "train_labeled_samples": int(all_feature_weights[train_idx].sum().item()) if all_feature_weights is not None else 0,
+        "val_labeled_samples": int(all_feature_weights[val_idx].sum().item()) if all_feature_weights is not None else 0,
+        "test_labeled_samples": int(all_feature_weights[test_idx].sum().item()) if all_feature_weights is not None else 0,
     }
+    summary.update(boundary_metrics)
     with cfg.summary_path.open("w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
     return summary
@@ -1149,9 +1341,14 @@ def run_saved_evaluation(cfg: Config, split: str) -> dict[str, float]:
         target_curve_points=cfg.target_curve_points,
     )
     all_feature_targets: torch.Tensor | None = None
-    all_feature_mask: torch.Tensor | None = None
+    all_feature_weights: torch.Tensor | None = None
     if cfg.use_notch_label_file:
-        all_feature_targets, all_feature_mask = build_label_feature_targets(base, cfg.labels_csv_path)
+        all_feature_targets, all_feature_weights = build_label_feature_targets(
+            base,
+            cfg.labels_csv_path,
+            min_confidence=cfg.label_min_confidence,
+            use_fallbacks=cfg.use_label_fallbacks,
+        )
     freq_axis_ghz = base.freq_axis_ghz.to(device)
     _train_loader, val_loader, test_loader, _train_idx, val_idx, test_idx = build_dataloaders(base, cfg, device)
     loader = val_loader if split == "val" else test_loader
@@ -1164,7 +1361,7 @@ def run_saved_evaluation(cfg: Config, split: str) -> dict[str, float]:
         cfg,
         device,
         all_feature_targets=all_feature_targets,
-        all_feature_mask=all_feature_mask,
+        all_feature_weights=all_feature_weights,
     )
     graphical_dir = save_prediction_graphs(
         model=model,
@@ -1182,6 +1379,17 @@ def run_saved_evaluation(cfg: Config, split: str) -> dict[str, float]:
     metrics["checkpoint"] = str(cfg.checkpoint_path)
     metrics["graphical_dir"] = str(graphical_dir)
     metrics["prediction_graph_count"] = min(cfg.prediction_plot_count, len(indices))
+    metrics.update(
+        evaluate_boundary_condition(
+            model,
+            base,
+            boundary_indices(base, cfg.boundary_antenna_id),
+            cfg,
+            device,
+            all_feature_targets,
+            all_feature_weights,
+        )
+    )
     return metrics
 
 
@@ -1201,8 +1409,13 @@ def inspect_processed_dataset(cfg: Config) -> None:
     print(f"First geometry bits: {base.geometry[0, :10].tolist()}")
     print(f"First curve values: {base.curves_db[0, :5].tolist()}")
     if cfg.use_notch_label_file:
-        _targets, mask = build_label_feature_targets(base, cfg.labels_csv_path)
-        print(f"Labeled notch rows: {int(mask.sum().item())}/{len(base)}")
+        _targets, weights = build_label_feature_targets(
+            base,
+            cfg.labels_csv_path,
+            min_confidence=cfg.label_min_confidence,
+            use_fallbacks=cfg.use_label_fallbacks,
+        )
+        print(f"Labeled notch rows: {int((weights > 0).sum().item())}/{len(base)}")
 
 
 def parse_args() -> Config:
@@ -1274,6 +1487,29 @@ def parse_args() -> Config:
                         help="Add a fixed binary feed-structure channel from meta feed_cells.")
     parser.add_argument("--disable-index-files", action="store_true")
     parser.add_argument("--disable-notch-label-file", action="store_true")
+    parser.add_argument(
+        "--label-min-confidence",
+        type=float,
+        default=cfg.label_min_confidence,
+        help="Minimum resonance-label confidence used by the R6O feature loss.",
+    )
+    parser.add_argument(
+        "--use-label-fallbacks",
+        action="store_true",
+        help="Also train the feature head on global-min fallback labels.",
+    )
+    parser.add_argument(
+        "--boundary-antenna-id",
+        type=int,
+        default=cfg.boundary_antenna_id,
+        help="Antenna id used as a repeated boundary/anchor condition during R6O training.",
+    )
+    parser.add_argument(
+        "--boundary-loss-weight",
+        type=float,
+        default=cfg.boundary_loss_weight,
+        help="Extra per-batch anchor weight for the boundary antenna. Set 0 to disable.",
+    )
     parser.add_argument("--er-default", type=float, default=cfg.er_default)
     parser.add_argument("--overwrite-processed", action="store_true")
     args = parser.parse_args()
@@ -1311,6 +1547,10 @@ def parse_args() -> Config:
     cfg.use_feed_channel = args.use_feed_channel
     cfg.use_index_files = not args.disable_index_files
     cfg.use_notch_label_file = not args.disable_notch_label_file
+    cfg.label_min_confidence = float(np.clip(args.label_min_confidence, 0.0, 1.0))
+    cfg.use_label_fallbacks = args.use_label_fallbacks
+    cfg.boundary_antenna_id = int(args.boundary_antenna_id)
+    cfg.boundary_loss_weight = max(0.0, float(args.boundary_loss_weight))
     cfg.er_default = float(np.clip(args.er_default, cfg.er_min, cfg.er_max))
     cfg.overwrite_processed = args.overwrite_processed
     return cfg
