@@ -151,6 +151,9 @@ class Config:
     er_max: float = 12.0
     loss_curve_weight: float = 1.0
     loss_feature_weight: float = 10.0
+    feature_finetune_epochs: int = 0
+    feature_finetune_min_confidence: float = 0.35
+    feature_finetune_lr: float = 1.0e-4
     patience: int = 18
     gradient_clip: float = 1.0
     log_every_batches: int = 10
@@ -1013,6 +1016,79 @@ def save_prediction_graphs(
     return output_dir
 
 
+def _run_feature_finetune(
+    model: "R6OMultiTask",
+    base: "ProcessedCurveDataset",
+    train_idx: list[int],
+    all_feature_targets: "torch.Tensor",
+    all_feature_weights: "torch.Tensor",
+    cfg: Config,
+    device: str,
+) -> None:
+    """Freeze encoder, train feature head only on high-confidence samples."""
+    min_conf = cfg.feature_finetune_min_confidence
+    ft_indices = [i for i in train_idx if float(all_feature_weights[i].item()) >= min_conf]
+    if not ft_indices:
+        print(f"Feature fine-tune: no samples with confidence >= {min_conf:.2f}; skipping.")
+        return
+    print(
+        f"Feature fine-tune: {len(ft_indices)} high-conf samples "
+        f"(conf >= {min_conf:.2f}), {cfg.feature_finetune_epochs} epochs, "
+        f"lr={cfg.feature_finetune_lr}"
+    )
+    for param in model.encoder.parameters():
+        param.requires_grad = False
+    ft_loader = DataLoader(
+        AntennaCurveDataset(base, ft_indices),
+        batch_size=cfg.batch_size,
+        shuffle=True,
+        pin_memory=(device == "cuda"),
+    )
+    ft_optimizer = torch.optim.Adam(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=cfg.feature_finetune_lr,
+    )
+    freq_span = max(float((base.freq_axis_ghz[-1] - base.freq_axis_ghz[0]).item()), 1.0e-6)
+    for ft_epoch in range(1, cfg.feature_finetune_epochs + 1):
+        model.train()
+        total_loss = 0.0
+        total_mae_norm = 0.0
+        count = 0
+        n_batches = 0
+        for geom_bits, material_map, feed_mask, _target_db, base_idx in ft_loader:
+            geom_bits = geom_bits.to(device)
+            material_map = material_map.to(device)
+            feed_mask = feed_mask.to(device)
+            w = all_feature_weights[base_idx].to(device)
+            tgt = all_feature_targets[base_idx].to(device)
+            ft_optimizer.zero_grad(set_to_none=True)
+            outputs = model(geom_bits, material_map, feed_mask=feed_mask)
+            w_sum = w.unsqueeze(-1).sum().clamp(min=1e-8)
+            per_sample = F.smooth_l1_loss(outputs.features, tgt, reduction="none")
+            loss = (w.unsqueeze(-1) * per_sample).sum() / w_sum
+            if not torch.isfinite(loss):
+                continue
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.gradient_clip)
+            ft_optimizer.step()
+            batch = geom_bits.size(0)
+            total_loss += loss.item() * batch
+            mae_norm = (w * (outputs.features.detach() - tgt).abs().squeeze(-1)).sum().item() / float(w_sum.item())
+            total_mae_norm += mae_norm
+            count += batch
+            n_batches += 1
+        avg_loss = total_loss / max(1, count)
+        avg_mae_norm = total_mae_norm / max(1, n_batches)
+        print(
+            f"  FT {ft_epoch:03d}/{cfg.feature_finetune_epochs} | "
+            f"feat_loss {avg_loss:.6f} | "
+            f"feat_mae {avg_mae_norm * freq_span:.4f} GHz"
+        )
+    for param in model.encoder.parameters():
+        param.requires_grad = True
+    print("Feature fine-tune complete.")
+
+
 def train_model(cfg: Config) -> dict[str, float]:
     require_torch("train")
     if (
@@ -1231,6 +1307,15 @@ def train_model(cfg: Config) -> dict[str, float]:
 
     best_model = build_model(cfg, device, seq_len=base.seq_len)
     load_model_weights(best_model, cfg.checkpoint_path, device)
+
+    if cfg.feature_finetune_epochs > 0 and all_feature_targets is not None and all_feature_weights is not None:
+        _run_feature_finetune(
+            best_model, base, train_idx,
+            all_feature_targets, all_feature_weights,
+            cfg, device,
+        )
+        save_checkpoint(cfg, best_model, optimizer, best_epoch, best_val)
+
     test_metrics = evaluate_model(
         best_model,
         test_loader,
@@ -1306,9 +1391,9 @@ def train_model(cfg: Config) -> dict[str, float]:
         "train_samples": len(train_idx),
         "val_samples": len(val_idx),
         "test_samples": len(test_idx),
-        "train_labeled_samples": int(all_feature_weights[train_idx].sum().item()) if all_feature_weights is not None else 0,
-        "val_labeled_samples": int(all_feature_weights[val_idx].sum().item()) if all_feature_weights is not None else 0,
-        "test_labeled_samples": int(all_feature_weights[test_idx].sum().item()) if all_feature_weights is not None else 0,
+        "train_labeled_samples": int((all_feature_weights[train_idx] > 0).sum().item()) if all_feature_weights is not None else 0,
+        "val_labeled_samples": int((all_feature_weights[val_idx] > 0).sum().item()) if all_feature_weights is not None else 0,
+        "test_labeled_samples": int((all_feature_weights[test_idx] > 0).sum().item()) if all_feature_weights is not None else 0,
     }
     summary.update(boundary_metrics)
     with cfg.summary_path.open("w", encoding="utf-8") as handle:
@@ -1512,6 +1597,24 @@ def parse_args() -> Config:
     )
     parser.add_argument("--er-default", type=float, default=cfg.er_default)
     parser.add_argument("--overwrite-processed", action="store_true")
+    parser.add_argument(
+        "--feature-finetune-epochs",
+        type=int,
+        default=cfg.feature_finetune_epochs,
+        help="After main training, freeze encoder and fine-tune feature head for N epochs (0 = disabled).",
+    )
+    parser.add_argument(
+        "--feature-finetune-min-confidence",
+        type=float,
+        default=cfg.feature_finetune_min_confidence,
+        help="Only include samples with label confidence >= this value for feature fine-tuning.",
+    )
+    parser.add_argument(
+        "--feature-finetune-lr",
+        type=float,
+        default=cfg.feature_finetune_lr,
+        help="Learning rate for the feature-head fine-tune phase.",
+    )
     args = parser.parse_args()
 
     cfg.command = args.command
@@ -1553,6 +1656,9 @@ def parse_args() -> Config:
     cfg.boundary_loss_weight = max(0.0, float(args.boundary_loss_weight))
     cfg.er_default = float(np.clip(args.er_default, cfg.er_min, cfg.er_max))
     cfg.overwrite_processed = args.overwrite_processed
+    cfg.feature_finetune_epochs = max(0, args.feature_finetune_epochs)
+    cfg.feature_finetune_min_confidence = float(np.clip(args.feature_finetune_min_confidence, 0.0, 1.0))
+    cfg.feature_finetune_lr = max(0.0, args.feature_finetune_lr)
     return cfg
 
 
