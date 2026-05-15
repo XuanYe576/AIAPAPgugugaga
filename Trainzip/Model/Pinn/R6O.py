@@ -151,6 +151,8 @@ class Config:
     er_max: float = 12.0
     loss_curve_weight: float = 1.0
     loss_feature_weight: float = 10.0
+    loss_focus_alpha: float = 2.0
+    loss_focus_bw_norm: float = 0.03
     feature_finetune_epochs: int = 0
     feature_finetune_min_confidence: float = 0.35
     feature_finetune_lr: float = 1.0e-4
@@ -792,6 +794,26 @@ class R6OMultiTask(nn.Module):
         return EvalOutputs(curve_db=curve_db, features=feature_raw)
 
 
+def _adaptive_resonance_loss(
+    pred: "torch.Tensor",
+    target: "torch.Tensor",
+    alpha: float,
+    bw_norm: float,
+) -> "torch.Tensor":
+    """Gaussian-amplified MSE: higher penalty when close-but-not-exact.
+
+    focus(err) = 1 + alpha * exp(-err^2 / (2 * bw_norm^2))
+    loss = focus * err^2
+
+    Far from target: focus~1 (standard MSE, pulls prediction in).
+    Within ~1 bandwidth of target: focus up to (1+alpha), amplified to
+    force precision — because a small frequency miss still fails the dip.
+    """
+    err = pred - target
+    focus = 1.0 + alpha * torch.exp(-err.pow(2) / (2.0 * max(bw_norm, 1e-6) ** 2))
+    return focus * err.pow(2)
+
+
 def compute_losses(
     outputs: EvalOutputs,
     target_db: torch.Tensor,
@@ -811,7 +833,11 @@ def compute_losses(
         else:
             w = feature_weights.unsqueeze(-1)  # [B, 1]
             w_sum = w.sum().clamp(min=1e-8)
-            per_sample = F.smooth_l1_loss(outputs.features, feature_targets, reduction="none")
+            per_sample = _adaptive_resonance_loss(
+                outputs.features, feature_targets,
+                alpha=cfg.loss_focus_alpha,
+                bw_norm=cfg.loss_focus_bw_norm,
+            )
             feature_loss = (w * per_sample).sum() / w_sum
             feature_mae_norm = (feature_weights * (outputs.features - feature_targets).abs().squeeze(-1)).sum() / w_sum
 
@@ -1064,7 +1090,11 @@ def _run_feature_finetune(
             ft_optimizer.zero_grad(set_to_none=True)
             outputs = model(geom_bits, material_map, feed_mask=feed_mask)
             w_sum = w.unsqueeze(-1).sum().clamp(min=1e-8)
-            per_sample = F.smooth_l1_loss(outputs.features, tgt, reduction="none")
+            per_sample = _adaptive_resonance_loss(
+                outputs.features, tgt,
+                alpha=cfg.loss_focus_alpha,
+                bw_norm=cfg.loss_focus_bw_norm,
+            )
             loss = (w.unsqueeze(-1) * per_sample).sum() / w_sum
             if not torch.isfinite(loss):
                 continue
@@ -1567,6 +1597,10 @@ def parse_args() -> Config:
     parser.add_argument("--strict-init", action="store_true")
     parser.add_argument("--loss-feature-weight", type=float, default=cfg.loss_feature_weight)
     parser.add_argument("--loss-curve-weight", type=float, default=cfg.loss_curve_weight)
+    parser.add_argument("--loss-focus-alpha", type=float, default=cfg.loss_focus_alpha,
+                        help="Gaussian amplification factor near resonance target (0=plain MSE).")
+    parser.add_argument("--loss-focus-bw-norm", type=float, default=cfg.loss_focus_bw_norm,
+                        help="Normalized resonance bandwidth for adaptive focus (freq_span units).")
     parser.add_argument("--disable-material-channel", action="store_true")
     parser.add_argument("--use-feed-channel", action="store_true",
                         help="Add a fixed binary feed-structure channel from meta feed_cells.")
@@ -1646,6 +1680,8 @@ def parse_args() -> Config:
     cfg.strict_init = args.strict_init
     cfg.loss_feature_weight = max(0.0, args.loss_feature_weight)
     cfg.loss_curve_weight = max(0.0, args.loss_curve_weight)
+    cfg.loss_focus_alpha = max(0.0, args.loss_focus_alpha)
+    cfg.loss_focus_bw_norm = max(1e-6, args.loss_focus_bw_norm)
     cfg.use_material_channel = not args.disable_material_channel
     cfg.use_feed_channel = args.use_feed_channel
     cfg.use_index_files = not args.disable_index_files

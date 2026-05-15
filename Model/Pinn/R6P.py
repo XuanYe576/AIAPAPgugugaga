@@ -147,6 +147,8 @@ class Config:
     loss_field: float = 0.02
     loss_notch: float = 0.05
     loss_notch_label: float = 2.0
+    loss_focus_alpha: float = 2.0
+    loss_focus_bw_norm: float = 0.03
     phys_mode_count: int = 2
     pole_damping_ratio: float = 0.03
     notch_sigma_db: float = 4.0
@@ -793,6 +795,25 @@ def _field_helmholtz_loss(field_map: torch.Tensor, beta_pred: torch.Tensor) -> t
     return residual.pow(2).mean()
 
 
+def _adaptive_resonance_loss(
+    pred: "torch.Tensor",
+    target: "torch.Tensor",
+    alpha: float,
+    bw_norm: float,
+) -> "torch.Tensor":
+    """Gaussian-amplified MSE: higher penalty when close-but-not-exact.
+
+    focus(err) = 1 + alpha * exp(-err^2 / (2 * bw_norm^2))
+    loss = focus * err^2
+
+    Amplifies gradient within ~1 resonance bandwidth of the target,
+    forcing precision once the prediction is in the right neighborhood.
+    """
+    err = pred - target
+    focus = 1.0 + alpha * torch.exp(-err.pow(2) / (2.0 * max(bw_norm, 1e-6) ** 2))
+    return focus * err.pow(2)
+
+
 def build_label_feature_targets(
     base: "ProcessedCurveDataset",
     labels_csv_path: Path,
@@ -908,7 +929,11 @@ def compute_losses(
         notch_pred_norm = notch_pred_norm.unsqueeze(-1)
         w = label_weights.unsqueeze(-1)
         w_sum = w.sum().clamp(min=1e-8)
-        per_sample = F.smooth_l1_loss(notch_pred_norm, label_targets, reduction="none")
+        per_sample = _adaptive_resonance_loss(
+            notch_pred_norm, label_targets,
+            alpha=cfg.loss_focus_alpha,
+            bw_norm=cfg.loss_focus_bw_norm,
+        )
         notch_label_loss = (w * per_sample).sum() / w_sum
     else:
         notch_label_loss = data_loss.new_zeros(())
@@ -1415,6 +1440,10 @@ def parse_args() -> Config:
     parser.add_argument("--loss-field", type=float, default=cfg.loss_field)
     parser.add_argument("--loss-notch", type=float, default=cfg.loss_notch)
     parser.add_argument("--loss-notch-label", type=float, default=cfg.loss_notch_label)
+    parser.add_argument("--loss-focus-alpha", type=float, default=cfg.loss_focus_alpha,
+                        help="Gaussian amplification factor near resonance target (0=plain MSE).")
+    parser.add_argument("--loss-focus-bw-norm", type=float, default=cfg.loss_focus_bw_norm,
+                        help="Normalized resonance bandwidth for adaptive focus (freq_span units).")
     parser.add_argument("--disable-aux-head", action="store_true")
     parser.add_argument("--disable-material-channel", action="store_true")
     parser.add_argument("--er-default", type=float, default=cfg.er_default)
@@ -1454,6 +1483,8 @@ def parse_args() -> Config:
     cfg.loss_field = max(0.0, args.loss_field)
     cfg.loss_notch = max(0.0, args.loss_notch)
     cfg.loss_notch_label = max(0.0, args.loss_notch_label)
+    cfg.loss_focus_alpha = max(0.0, args.loss_focus_alpha)
+    cfg.loss_focus_bw_norm = max(1e-6, args.loss_focus_bw_norm)
     cfg.use_aux_head = not args.disable_aux_head
     cfg.use_material_channel = not args.disable_material_channel
     cfg.er_default = float(np.clip(args.er_default, cfg.er_min, cfg.er_max))
