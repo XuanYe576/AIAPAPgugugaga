@@ -94,8 +94,8 @@ def parse_geometry_catalog(
 def collect_curve_paths(root: Path) -> tuple[dict[int, Path], dict[int, list[Path]]]:
     selected: dict[int, Path] = {}
     duplicates: dict[int, list[Path]] = defaultdict(list)
-    for path in sorted(root.rglob("patch_*_s11_plot.csv")):
-        match = re.search(r"patch_(\d+)_s11_plot\.csv$", path.name)
+    for path in sorted(root.rglob("patch_*_s11*.csv")):
+        match = re.search(r"patch_(\d+)_s11(?:_plot)?\.csv$", path.name)
         if not match:
             continue
         antenna_id = int(match.group(1))
